@@ -33,6 +33,14 @@
   // Example: https://ref-data.everef.net/blueprints/2457
   const EVEREF_BLUEPRINT_BASE = 'https://ref-data.everef.net/blueprints';
 
+  // Fuzzwork blueprint API (public, no auth). Expects PRODUCT typeID (not blueprint typeID).
+  // Example: https://www.fuzzwork.co.uk/blueprint/api/blueprint.php?typeid=587
+  const FUZZWORK_BLUEPRINT_API = 'https://www.fuzzwork.co.uk/blueprint/api/blueprint.php';
+
+  // Simple public CORS proxy (used only as a last-resort fallback when a public API doesn't send CORS headers).
+  // NOTE: Avoid relying on this for normal operation.
+  const CORS_PROXY_ALLORIGINS = 'https://api.allorigins.win/raw?url=';
+
   const STORAGE_KEYS = {
     settings: 'evirp.settings.v1',
     priceCache: 'evirp.prices.v1',
@@ -595,41 +603,57 @@
     cache[key] = { ts: nowMs(), ttlMs, value };
   }
 
+  
   async function resolveTypeIdByName(name) {
     if (!name) return null;
+
+    // Exact match in bundled subset
     const exact = state.data.typesByName.get(name);
     if (exact?.typeId) return exact.typeId;
 
-    // cached lookup
+    // Cached lookup
     const cacheKey = `typeIdByName:${normalizeName(name)}`;
     const cached = getCachedEntry(state.caches.types, cacheKey);
     if (cached) return cached;
 
-    // Use ESI search
-    try {
-      // NOTE: ESI language values are like "en-us". To avoid accidental 400s from a bad language
-      // parameter (e.g. "en"), we omit it and let ESI default to English.
-      const url = `${ESI_BASE}/search/?${ESI_DATASOURCE}&categories=inventory_type&strict=true&search=${encodeURIComponent(name)}`;
+    const trySearch = async (strict) => {
+      const url = `${ESI_BASE}/search/?${ESI_DATASOURCE}&categories=inventory_type&strict=${strict ? 'true' : 'false'}&search=${encodeURIComponent(
+        name
+      )}`;
       const res = await withTimeout(fetch(url, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI search');
       if (!res.ok) throw new Error(`ESI search failed: ${res.status}`);
       const data = await res.json();
-      const ids = data?.inventory_type || [];
+      return data?.inventory_type || [];
+    };
+
+    try {
+      // Prefer exact match, then fall back to partial match.
+      let ids = await trySearch(true);
+      if (!ids.length) ids = await trySearch(false);
+
       const typeId = ids.length ? ids[0] : null;
       if (typeId) setCachedEntry(state.caches.types, cacheKey, typeId, CACHE_TTL_MS.types);
       return typeId;
     } catch (e) {
-      console.warn('Type search failed, using local fallback only:', name, e);
+      console.warn('Type search failed (ESI):', name, e);
+
+      // Last resort: normalized exact match in bundled subset
+      const want = normalizeName(name);
+      for (const [n, info] of state.data.typesByName.entries()) {
+        if (normalizeName(n) === want && info?.typeId) return info.typeId;
+      }
       return null;
     }
   }
 
   async function getTypeInfo(typeId) {
     if (!typeId) return null;
+
     const cacheKey = `typeInfo:${typeId}`;
     const cached = getCachedEntry(state.caches.types, cacheKey);
     if (cached) return cached;
 
-    // local fallback
+    // bundled subset fallback
     for (const [name, info] of state.data.typesByName.entries()) {
       if (info.typeId === typeId) {
         const v = { name, ...info };
@@ -654,8 +678,8 @@
       return info;
     } catch (e) {
       console.warn('Type info fetch failed:', typeId, e);
-      // very last resort: return something
-      const info = { typeId, name: `Type ${typeId}`, packaged_volume: null };
+      // last resort: return something stable
+      const info = { typeId, name: `Type ${typeId}`, packaged_volume: null, group_id: null };
       setCachedEntry(state.caches.types, cacheKey, info, 60 * 60 * 1000);
       return info;
     }
@@ -663,6 +687,7 @@
 
   async function inferCategoryTagByTypeId(typeId) {
     if (!typeId) return 'other';
+
     const local = state.data.categoryTagByTypeId.get(typeId);
     if (local) return local;
 
@@ -673,6 +698,7 @@
     try {
       const info = await getTypeInfo(typeId);
       if (!info?.group_id) return 'other';
+
       const groupUrl = `${ESI_BASE}/universe/groups/${info.group_id}/?${ESI_DATASOURCE}`;
       const groupRes = await withTimeout(fetch(groupUrl, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI group');
       if (!groupRes.ok) throw new Error(`ESI group failed: ${groupRes.status}`);
@@ -686,7 +712,7 @@
       else if (gname.includes('charge') || gname.includes('ammo') || gname.includes('ammunition')) tag = 'ammo';
       else if (gname.includes('blueprint')) tag = 'blueprint';
 
-      // If ambiguous, look at category name
+      // If ambiguous, look at category name too.
       if (tag === 'other' && catId) {
         const catUrl = `${ESI_BASE}/universe/categories/${catId}/?${ESI_DATASOURCE}`;
         const catRes = await withTimeout(fetch(catUrl, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI category');
@@ -694,7 +720,7 @@
           const cat = await catRes.json();
           const cname = String(cat?.name || '').toLowerCase();
           if (cname.includes('charge') || cname.includes('ammunition')) tag = 'ammo';
-          if (cname.includes('drone')) tag = 'drone';
+          else if (cname.includes('drone')) tag = 'drone';
         }
       }
 
@@ -707,13 +733,36 @@
   }
 
   // -----------------------------
-  // Blueprint fetching (bundled subset + EVE Ref enrichment)
+  // Blueprint fetching (bundled subset + EVE Ref enrichment + Fuzzwork fallback)
   // -----------------------------
 
+  async function fetchJsonWithFallback(url, label) {
+    // Try direct fetch first.
+    try {
+      const res = await withTimeout(fetch(url, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, label);
+      if (!res.ok) throw new Error(`${label} failed: ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      // Most common here is CORS or transient network issues.
+      console.warn(`${label} direct fetch failed; trying CORS proxy...`, url, e);
+    }
+
+    // Last-resort: public CORS proxy
+    try {
+      const proxied = `${CORS_PROXY_ALLORIGINS}${encodeURIComponent(url)}`;
+      const res = await withTimeout(fetch(proxied, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, `${label} (proxy)`);
+      if (!res.ok) throw new Error(`${label} proxy failed: ${res.status}`);
+      return await res.json();
+    } catch (e2) {
+      console.warn(`${label} proxy fetch failed:`, url, e2);
+      return null;
+    }
+  }
+
   function normalizeBlueprintRecord(bp) {
-    // Accept both local-bundled format and EVE Ref format converted.
+    // Accept both local-bundled format and converted API formats.
     if (!bp) return null;
-    if (bp.activities?.manufacturing?.product) return bp; // local normalized
+    if (bp.activities?.manufacturing?.product) return bp;
     return bp;
   }
 
@@ -760,11 +809,68 @@
         research_material: researchMat ? { time: researchMat.time ?? null, materials: rmMaterials } : null,
         research_time: researchTime ? { time: researchTime.time ?? null, materials: rtMaterials } : null,
       },
+      _sources: { blueprint: 'everef' },
     };
+  }
+
+  function convertFuzzworkBlueprintJson(json, blueprintTypeIdHint = null) {
+    // Fuzzwork API returns blueprint details keyed by PRODUCT typeID.
+    const details = json?.blueprintDetails;
+    if (!details?.productTypeID) return null;
+
+    const times = details.times || {};
+    const mats = json.activityMaterials || {};
+
+    const mapMats = (arr) => (Array.isArray(arr) ? arr.map((m) => ({ typeId: m.typeid, quantity: m.quantity })) : []);
+
+    const manufacturing = {
+      time: times['1'] ?? null,
+      product: { typeId: details.productTypeID, quantity: details.productQuantity ?? 1 },
+      materials: mapMats(mats['1']),
+    };
+
+    const copying = times['5'] != null ? { time: times['5'] } : null;
+    const invention = times['8'] != null || mats['8']
+      ? { time: times['8'] ?? null, products: [], materials: mapMats(mats['8']) }
+      : null;
+
+    const research_time = times['3'] != null ? { time: times['3'], materials: mapMats(mats['3']) } : null;
+    const research_material = times['4'] != null ? { time: times['4'], materials: mapMats(mats['4']) } : null;
+
+    // NOTE: Fuzzwork's endpoint does not include invention output blueprints/products, so
+    // the "Copy → Invention → Build" chain will only be enabled when we have EVE Ref data.
+    return {
+      blueprintTypeId: blueprintTypeIdHint,
+      name: blueprintTypeIdHint ? `Blueprint ${blueprintTypeIdHint}` : `${details.productTypeName} Blueprint`,
+      maxRuns: details.maxProductionLimit ?? null,
+      activities: { manufacturing, copying, invention, research_material, research_time },
+      _sources: { blueprint: 'fuzzwork', requestedId: json.requestedid, productTypeId: details.productTypeID },
+    };
+  }
+
+  async function getBlueprintByProductTypeId(productTypeId, { blueprintTypeIdHint = null } = {}) {
+    if (!productTypeId) return null;
+
+    const cacheKey = `blueprintByProduct:${productTypeId}`;
+    const cached = getCachedEntry(state.caches.blueprints, cacheKey);
+    if (cached) return cached;
+
+    const url = `${FUZZWORK_BLUEPRINT_API}?typeid=${productTypeId}`;
+    const j = await fetchJsonWithFallback(url, 'Fuzzwork blueprint');
+    const converted = j ? convertFuzzworkBlueprintJson(j, blueprintTypeIdHint) : null;
+    if (converted) {
+      setCachedEntry(state.caches.blueprints, cacheKey, converted, CACHE_TTL_MS.blueprints);
+      if (blueprintTypeIdHint) {
+        setCachedEntry(state.caches.blueprints, `blueprint:${blueprintTypeIdHint}`, converted, CACHE_TTL_MS.blueprints);
+      }
+      return converted;
+    }
+    return null;
   }
 
   async function getBlueprintByTypeId(typeId) {
     if (!typeId) return null;
+
     const cacheKey = `blueprint:${typeId}`;
     const cached = getCachedEntry(state.caches.blueprints, cacheKey);
     if (cached) return cached;
@@ -775,21 +881,32 @@
       return bundled;
     }
 
-    try {
-      const url = `${EVEREF_BLUEPRINT_BASE}/${typeId}`;
-      const res = await withTimeout(fetch(url, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'EVE Ref blueprint');
-      if (!res.ok) throw new Error(`EVE Ref blueprint failed: ${res.status}`);
-      const j = await res.json();
-      const converted = convertEveRefBlueprintJson(j);
-      if (converted) {
-        setCachedEntry(state.caches.blueprints, cacheKey, converted, CACHE_TTL_MS.blueprints);
-        return converted;
-      }
-      return null;
-    } catch (e) {
-      console.warn('Blueprint fetch failed:', typeId, e);
-      return null;
+    // Primary: EVE Ref blueprint JSON by blueprint typeID.
+    const url = `${EVEREF_BLUEPRINT_BASE}/${typeId}`;
+    const j = await fetchJsonWithFallback(url, 'EVE Ref blueprint');
+    const converted = j ? convertEveRefBlueprintJson(j) : null;
+    if (converted) {
+      setCachedEntry(state.caches.blueprints, cacheKey, converted, CACHE_TTL_MS.blueprints);
+      return converted;
     }
+
+    // Fallback: derive product typeID from the blueprint's type name, then query Fuzzwork.
+    try {
+      const t = await getTypeInfo(typeId);
+      const bpName = String(t?.name || '');
+      const prodName = bpName.replace(/\s*Blueprint\s*$/i, '').trim();
+      if (prodName && prodName !== bpName) {
+        const prodTypeId = await resolveTypeIdByName(prodName);
+        if (prodTypeId) {
+          const fw = await getBlueprintByProductTypeId(prodTypeId, { blueprintTypeIdHint: typeId });
+          if (fw) return fw;
+        }
+      }
+    } catch (e) {
+      console.warn('Fuzzwork fallback by blueprint name failed:', typeId, e);
+    }
+
+    return null;
   }
 
   async function resolveBlueprintConsiderProductName(name) {
@@ -797,25 +914,67 @@
     if (!name) return null;
     const nm = normalizeName(name);
 
-    // fast path: if user pasted blueprint name, resolve that.
-    let candidates = [name];
-    if (!/\bblueprint\b/i.test(name)) candidates = [name, `${name} Blueprint`];
+    const candidates = /\bblueprint\b/i.test(name) ? [name] : [name, `${name} Blueprint`];
 
     for (const cand of candidates) {
+      const hasBlueprintWord = /\bblueprint\b/i.test(cand);
       const typeId = await resolveTypeIdByName(cand);
       if (!typeId) continue;
-      const bp = await getBlueprintByTypeId(typeId);
-      if (bp?.activities?.manufacturing?.product?.typeId) {
-        return {
-          name: cand,
-          blueprintTypeId: typeId,
-          productTypeId: bp.activities.manufacturing.product.typeId,
-          blueprint: bp,
-        };
+
+      if (hasBlueprintWord) {
+        // Candidate is a blueprint type name → blueprint typeID.
+        const bp = await getBlueprintByTypeId(typeId);
+        if (bp?.activities?.manufacturing?.product?.typeId) {
+          return {
+            name: cand,
+            blueprintTypeId: typeId,
+            productTypeId: bp.activities.manufacturing.product.typeId,
+            blueprint: bp,
+          };
+        }
+
+        // If EVE Ref failed (e.g. CORS), try: strip "Blueprint" → resolve product → fuzzwork.
+        const prodName = cand.replace(/\s*Blueprint\s*$/i, '').trim();
+        if (prodName) {
+          const prodTypeId = await resolveTypeIdByName(prodName);
+          if (prodTypeId) {
+            const bp2 = await getBlueprintByProductTypeId(prodTypeId, { blueprintTypeIdHint: typeId });
+            if (bp2?.activities?.manufacturing?.product?.typeId) {
+              return {
+                name: cand,
+                blueprintTypeId: typeId,
+                productTypeId: bp2.activities.manufacturing.product.typeId,
+                blueprint: bp2,
+              };
+            }
+          }
+        }
+      } else {
+        // Candidate is a PRODUCT type name → product typeID → fuzzwork can return the blueprint data.
+        const bp = await getBlueprintByProductTypeId(typeId);
+        if (bp?.activities?.manufacturing?.product?.typeId) {
+          return {
+            name: cand,
+            blueprintTypeId: bp.blueprintTypeId ?? null,
+            productTypeId: bp.activities.manufacturing.product.typeId,
+            blueprint: bp,
+          };
+        }
+
+        // As a last resort, try treating this as a blueprint typeID.
+        const bp2 = await getBlueprintByTypeId(typeId);
+        if (bp2?.activities?.manufacturing?.product?.typeId) {
+          return {
+            name: cand,
+            blueprintTypeId: typeId,
+            productTypeId: bp2.activities.manufacturing.product.typeId,
+            blueprint: bp2,
+          };
+        }
       }
     }
 
-    // If user pasted product name and blueprint isn't resolvable, try to find *any* blueprint in cache that produces it (bundled subset only)
+    // Offline subset fallback: find any bundled blueprint that produces this product name.
     for (const [typeId, bp] of state.data.blueprintsByTypeId.entries()) {
       const prodId = bp?.activities?.manufacturing?.product?.typeId;
       if (!prodId) continue;
@@ -824,10 +983,10 @@
         return { name, blueprintTypeId: typeId, productTypeId: prodId, blueprint: bp };
       }
     }
+
     return null;
   }
-
-  // -----------------------------
+// -----------------------------
   // Live pricing (ESI orders) + caching + fallback
   // -----------------------------
 
