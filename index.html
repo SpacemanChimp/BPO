@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Static GitHub Pages app to evaluate EVE Online industry opportunities by build location and live Jita prices." />
+    <title>EVE Industry Route Planner</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">⛏️</div>
+        <div>
+          <h1>EVE Industry Route Planner</h1>
+          <p class="sub">Location-aware industry planner (HS/LS/NS/WH → Jita) + live Jita prices</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btnRefreshPrices" class="btn">Refresh Prices</button>
+        <button id="btnClearCache" class="btn btn-ghost" title="Clears local cache for prices and type lookups">Clear Cache</button>
+        <a class="btn btn-ghost" href="README.md" target="_blank" rel="noreferrer">README</a>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel left">
+        <div class="panel-title">
+          <h2>Inputs</h2>
+          <div class="mini-status" id="statusBar">Loading…</div>
+        </div>
+
+        <label class="field">
+          <span>Paste your T1 BPO list (one per line)</span>
+          <textarea id="bpoInput" rows="10" spellcheck="false" placeholder="Examples:\nHobgoblin I Blueprint ME10 TE20\nAntimatter Charge S (ME 10 / TE 20)\nSmall Core Defense Field Extender I, ME8, TE14\nDamage Control I ME0 TE0"></textarea>
+          <div class="hint">
+            Tip: You can paste either the blueprint name (… Blueprint) or the product name.
+            ME/TE parsing is flexible (ME10 TE20, ME: 10, TE=20, etc.).
+          </div>
+        </label>
+
+        <div class="grid2">
+          <label class="field">
+            <span>Build location security</span>
+            <select id="buildSec">
+              <option value="HS">Highsec</option>
+              <option value="LS">Lowsec</option>
+              <option value="NS">Nullsec</option>
+              <option value="WH">Wormhole</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Ranking mode</span>
+            <select id="rankingMode">
+              <option value="profit_day">Profit/day (per bottleneck slot)</option>
+              <option value="profit_run">Profit/run</option>
+              <option value="profit_m3">Profit per m³</option>
+              <option value="margin">Margin %</option>
+            </select>
+          </label>
+        </div>
+
+        <details class="accordion" open>
+          <summary>Settings → Build Location</summary>
+          <div class="accordion-body">
+            <div class="grid3">
+              <label class="field">
+                <span>Build market region ID</span>
+                <input id="buildRegionId" inputmode="numeric" placeholder="e.g. 10000002" />
+                <div class="hint">Optional. Used for local material pricing (buy/sell orders).</div>
+              </label>
+              <label class="field">
+                <span>Build market system ID</span>
+                <input id="buildSystemId" inputmode="numeric" placeholder="e.g. 30000142" />
+                <div class="hint">Optional. Narrows to a system inside the region.</div>
+              </label>
+              <label class="field">
+                <span>Station / structure ID</span>
+                <input id="buildStationId" inputmode="numeric" placeholder="NPC station ID" />
+                <div class="hint">Optional. Player structure markets require auth (not supported); NPC station IDs work.</div>
+              </label>
+            </div>
+
+            <div class="grid2">
+              <label class="field">
+                <span>System cost index multiplier</span>
+                <input id="systemIndexMultiplier" inputmode="decimal" placeholder="e.g. 0.92" />
+                <div class="hint">Used to scale job fees/installation costs (simplified).</div>
+              </label>
+              <label class="field">
+                <span>Sell locally instead of Jita</span>
+                <div style="display:flex;align-items:center;gap:10px">
+                  <input id="sellLocalToggle" type="checkbox" />
+                  <span class="hint">If ON: revenue uses local sell and hauling is removed.</span>
+                </div>
+              </label>
+            </div>
+
+            <div class="grid2">
+              <label class="field">
+                <span>Costs use</span>
+                <select id="costPriceBasis">
+                  <option value="buy">Buy price (default)</option>
+                  <option value="sell">Sell price (conservative)</option>
+                </select>
+                <div class="hint">Applied to input acquisition markets (local first; fallback to Jita).</div>
+              </label>
+
+              <label class="field">
+                <span>Revenue uses</span>
+                <select id="revenuePriceBasis">
+                  <option value="sell">Jita sell (default)</option>
+                  <option value="buy">Jita buy (fast liquidation)</option>
+                </select>
+                <div class="hint">Applied to the output market (Jita unless “Sell locally”).</div>
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="accordion">
+          <summary>Settings → Sourcing (ore/ice reprocessing)</summary>
+          <div class="accordion-body">
+            <label class="field checkbox">
+              <input id="sourceFromReprocessing" type="checkbox" />
+              <span>I source minerals from reprocessing my own ore/ice (default OFF)</span>
+            </label>
+
+            <div class="grid2">
+              <label class="field">
+                <span>Reprocessing efficiency %</span>
+                <input id="reprocEff" inputmode="decimal" placeholder="e.g. 78" />
+              </label>
+              <label class="field">
+                <span>Mineral opportunity pricing</span>
+                <select id="mineralOpportunityBasis">
+                  <option value="local_buy">Local buy</option>
+                  <option value="jita_buy">Jita buy</option>
+                </select>
+              </label>
+            </div>
+
+            <label class="field">
+              <span>Optional mineral stockpile (one per line: Mineral=Qty)</span>
+              <textarea id="mineralStockpile" rows="4" spellcheck="false" placeholder="Tritanium=5000000\nPyerite=200000\nMexallon=50000"></textarea>
+              <div class="hint">If empty, assumes unlimited stockpile (still costed at opportunity cost).</div>
+            </label>
+          </div>
+        </details>
+
+        <details class="accordion">
+          <summary>Settings → Job Slots & Utilization</summary>
+          <div class="accordion-body">
+            <div class="grid2">
+              <label class="field">
+                <span>Manufacturing slots</span>
+                <input id="mfgSlots" inputmode="numeric" placeholder="10" />
+              </label>
+              <label class="field">
+                <span>Copy slots</span>
+                <input id="copySlots" inputmode="numeric" placeholder="3" />
+              </label>
+              <label class="field">
+                <span>Invention slots</span>
+                <input id="invSlots" inputmode="numeric" placeholder="3" />
+              </label>
+              <label class="field">
+                <span>Utilization %</span>
+                <input id="utilPct" inputmode="decimal" placeholder="70" />
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="accordion" open>
+          <summary>Settings → Logistics & Risk</summary>
+          <div class="accordion-body">
+            <div class="grid2">
+              <label class="field">
+                <span>Haul method</span>
+                <select id="haulMethod">
+                  <option value="NOT_SURE">Not sure</option>
+                  <option value="BR">Blockade Runner</option>
+                  <option value="DST">Deep Space Transport</option>
+                  <option value="JF">Jump Freighter</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>ISK per m³ (shipping cost)</span>
+                <input id="iskPerM3" inputmode="decimal" placeholder="e.g. 800" />
+              </label>
+            </div>
+
+            <div class="grid3">
+              <label class="field">
+                <span>Risk premium %</span>
+                <input id="riskPremium" inputmode="decimal" placeholder="e.g. 3" />
+              </label>
+              <label class="field">
+                <span>Estimated loss rate %</span>
+                <input id="lossRate" inputmode="decimal" placeholder="e.g. 0.5" />
+              </label>
+              <label class="field">
+                <span>Max m³ per trip (optional)</span>
+                <input id="maxM3" inputmode="decimal" placeholder="e.g. 320000" />
+              </label>
+            </div>
+
+            <label class="field">
+              <span>Production horizon days</span>
+              <input id="horizonDays" inputmode="numeric" placeholder="7" />
+            </label>
+          </div>
+        </details>
+
+        <details class="accordion">
+          <summary>Settings → Filters / Risk Controls</summary>
+          <div class="accordion-body">
+            <div class="grid2">
+              <label class="field">
+                <span>Exclude margin % &lt;</span>
+                <input id="minMargin" inputmode="decimal" placeholder="8" />
+              </label>
+              <label class="field">
+                <span>Exclude profit/run &lt; (ISK)</span>
+                <input id="minProfit" inputmode="decimal" placeholder="250000" />
+              </label>
+            </div>
+
+            <div class="grid2">
+              <label class="field">
+                <span>Capital ceiling (optional)</span>
+                <input id="capitalCeiling" inputmode="decimal" placeholder="" />
+                <div class="hint">If set, excludes items whose required capital exceeds this.</div>
+              </label>
+              <label class="field">
+                <span>Competition score threshold (0–100)</span>
+                <input id="maxCompetition" inputmode="decimal" placeholder="70" />
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="accordion" open>
+          <summary>Settings → Invention</summary>
+          <div class="accordion-body">
+            <label class="field checkbox">
+              <input id="enableOtherInvention" type="checkbox" />
+              <span>Enable invention for other categories (default OFF)</span>
+            </label>
+
+            <div class="hint">
+              By default, invention opportunities are only considered for: <b>Rigs</b>, <b>Ammo</b>, and <b>Drones</b>.
+              You can tweak baseline invention parameters below (used when blueprint-specific invention data isn’t bundled).
+            </div>
+
+            <div class="grid3">
+              <label class="field">
+                <span>Ammo success chance %</span>
+                <input id="invChanceAmmo" inputmode="decimal" placeholder="40" />
+              </label>
+              <label class="field">
+                <span>Drone success chance %</span>
+                <input id="invChanceDrone" inputmode="decimal" placeholder="35" />
+              </label>
+              <label class="field">
+                <span>Rig success chance %</span>
+                <input id="invChanceRig" inputmode="decimal" placeholder="40" />
+              </label>
+            </div>
+
+            <div class="grid2">
+              <label class="field">
+                <span>Expected decryptor cost (ISK)</span>
+                <input id="decryptorCost" inputmode="decimal" placeholder="0" />
+                <div class="hint">Set to 0 if you don’t use decryptors.</div>
+              </label>
+              <label class="field">
+                <span>Invention job fee rate % (of materials cost)</span>
+                <input id="inventionFeeRate" inputmode="decimal" placeholder="1.5" />
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="accordion">
+          <summary>Settings → Component awareness (T2)</summary>
+          <div class="accordion-body">
+            <label class="field checkbox">
+              <input id="componentAwareness" type="checkbox" />
+              <span>Component sourcing comparison (T2) (default OFF)</span>
+            </label>
+            <div class="hint">If enabled and T2 manufacturing data is present, the app will compare buying components in Jita vs building them locally.</div>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button id="btnAnalyze" class="btn btn-primary">Analyze Opportunities</button>
+          <button id="btnLoadExample" class="btn">Load Example</button>
+        </div>
+
+        <div class="panel-footer">
+          <div class="hint">
+            This is a static web app. Live prices come from public APIs (ESI, with fallbacks). If an API fails, cached or mocked data will be used.
+          </div>
+        </div>
+      </section>
+
+      <section class="panel right">
+        <div class="panel-title">
+          <h2>Results</h2>
+          <div class="toolbar">
+            <button id="btnExportCsv" class="btn btn-ghost">Export CSV</button>
+            <button id="btnCopyShopping" class="btn btn-ghost">Copy Shopping List</button>
+            <button id="btnViewWatchlist" class="btn btn-ghost">Watchlist</button>
+          </div>
+        </div>
+
+        <div class="cards" id="summaryCards">
+          <div class="card">
+            <div class="card-k">Price source</div>
+            <div class="card-v" id="priceSource">—</div>
+          </div>
+          <div class="card">
+            <div class="card-k">Cache freshness</div>
+            <div class="card-v" id="cacheFreshness">—</div>
+          </div>
+          <div class="card">
+            <div class="card-k">Bottleneck</div>
+            <div class="card-v" id="bottleneck">—</div>
+          </div>
+          <div class="card">
+            <div class="card-k">Trips/week</div>
+            <div class="card-v" id="tripsWeek">—</div>
+          </div>
+        </div>
+
+        <div class="widgets">
+          <div class="widget">
+            <h3>Top 10 per manufacturing slot</h3>
+            <ol id="topMfg"></ol>
+          </div>
+          <div class="widget">
+            <h3>Top 10 per copy slot</h3>
+            <ol id="topCopy"></ol>
+          </div>
+          <div class="widget">
+            <h3>Top 10 per invention slot</h3>
+            <ol id="topInv"></ol>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="results">
+            <thead>
+              <tr>
+                <th>Blueprint</th>
+                <th>Best action</th>
+                <th class="num">Profit/run</th>
+                <th class="num">Profit/hr</th>
+                <th class="num">Profit/day</th>
+                <th class="num">Profit/m³</th>
+                <th class="num">Margin</th>
+                <th class="num">Capital</th>
+                <th class="num">Time</th>
+                <th class="num">Comp.</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="resultsBody">
+              <tr>
+                <td colspan="11" class="muted">Run an analysis to see results.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="watchlistDialog" class="dialog">
+      <form method="dialog">
+        <div class="dialog-header">
+          <h3>Watchlist</h3>
+          <button class="btn btn-ghost" value="cancel">Close</button>
+        </div>
+        <div class="dialog-body">
+          <div class="hint">Items in your watchlist are stored in localStorage (device-local).</div>
+          <div id="watchlistItems" class="watchlist"></div>
+        </div>
+        <div class="dialog-footer">
+          <button id="btnClearWatchlist" class="btn btn-ghost" value="cancel">Clear Watchlist</button>
+        </div>
+      </form>
+    </dialog>
+
+    <template id="rowDetailTemplate">
+      <tr class="detail-row">
+        <td colspan="11">
+          <div class="detail">
+            <div class="detail-grid">
+              <div>
+                <h4>How to</h4>
+                <ol class="steps"></ol>
+                <div class="detail-actions">
+                  <button class="btn btn-ghost btn-copy-list" type="button">Copy shopping list</button>
+                  <button class="btn btn-ghost btn-add-watch" type="button">Add to watchlist</button>
+                </div>
+              </div>
+              <div>
+                <h4>Materials</h4>
+                <div class="materials"></div>
+              </div>
+              <div>
+                <h4>Costs & fees</h4>
+                <div class="breakdown"></div>
+                <h4>Invention</h4>
+                <div class="invention"></div>
+              </div>
+            </div>
+          </div>
+        </td>
+      </tr>
+    </template>
+
+    <footer class="app-footer">
+      <span>Static GitHub Pages • Vanilla JS • Live prices (ESI w/ cache & fallback) • Not affiliated with CCP Games</span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
