@@ -17,7 +17,7 @@
   // Constants
   // -----------------------------
 
-  const APP_VERSION = '1.0.1';
+  const APP_VERSION = '1.0.2';
 
   const ESI_BASE = 'https://esi.evetech.net/latest';
   const ESI_DATASOURCE = 'datasource=tranquility';
@@ -607,9 +607,9 @@
 
     // Use ESI search
     try {
-      const url = `${ESI_BASE}/search/?${ESI_DATASOURCE}&categories=inventory_type&language=en&strict=true&search=${encodeURIComponent(
-        name
-      )}`;
+      // NOTE: ESI language values are like "en-us". To avoid accidental 400s from a bad language
+      // parameter (e.g. "en"), we omit it and let ESI default to English.
+      const url = `${ESI_BASE}/search/?${ESI_DATASOURCE}&categories=inventory_type&strict=true&search=${encodeURIComponent(name)}`;
       const res = await withTimeout(fetch(url, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI search');
       if (!res.ok) throw new Error(`ESI search failed: ${res.status}`);
       const data = await res.json();
@@ -639,7 +639,7 @@
     }
 
     try {
-      const url = `${ESI_BASE}/universe/types/${typeId}/?${ESI_DATASOURCE}&language=en`;
+      const url = `${ESI_BASE}/universe/types/${typeId}/?${ESI_DATASOURCE}`;
       const res = await withTimeout(fetch(url, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI type');
       if (!res.ok) throw new Error(`ESI type failed: ${res.status}`);
       const d = await res.json();
@@ -673,7 +673,7 @@
     try {
       const info = await getTypeInfo(typeId);
       if (!info?.group_id) return 'other';
-      const groupUrl = `${ESI_BASE}/universe/groups/${info.group_id}/?${ESI_DATASOURCE}&language=en`;
+      const groupUrl = `${ESI_BASE}/universe/groups/${info.group_id}/?${ESI_DATASOURCE}`;
       const groupRes = await withTimeout(fetch(groupUrl, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI group');
       if (!groupRes.ok) throw new Error(`ESI group failed: ${groupRes.status}`);
       const group = await groupRes.json();
@@ -688,7 +688,7 @@
 
       // If ambiguous, look at category name
       if (tag === 'other' && catId) {
-        const catUrl = `${ESI_BASE}/universe/categories/${catId}/?${ESI_DATASOURCE}&language=en`;
+        const catUrl = `${ESI_BASE}/universe/categories/${catId}/?${ESI_DATASOURCE}`;
         const catRes = await withTimeout(fetch(catUrl, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI category');
         if (catRes.ok) {
           const cat = await catRes.json();
@@ -1787,7 +1787,7 @@
           suffix = 'buy (insufficient build data)';
         }
       }
-      right.textContent = `${fmtIsk(r.line)} (${suffix})`;
+      right.textContent = `${fmtIsk(r.line)}  @ ${fmtIsk(r.price)} (${suffix})`;
       line.append(left, right);
       wrap.appendChild(line);
     }
