@@ -19,7 +19,7 @@
   // Constants
   // -----------------------------
 
-  const APP_VERSION = '1.0.5';
+  const APP_VERSION = '1.0.6';
 
   const ESI_BASE = 'https://esi.evetech.net/latest';
   const ESI_DATASOURCE = 'datasource=tranquility';
@@ -1668,40 +1668,88 @@
   }
 
   async function buildOpportunity_ResearchFirst({ bpo, bp, productTypeId, localCtx, jitaCtx, settings }) {
-    // Uses blueprint research activities when available; otherwise returns null.
+    // Recommend researching ME/TE when the net gain (over your configured horizon) is positive.
+    // This replaces the older fixed +1 ME / +2 TE heuristic by searching candidate targets.
+
     const rm = bp.activities.research_material;
     const rt = bp.activities.research_time;
-    if (!rm?.time && !rt?.time) return null;
 
-    // Simple heuristic: check profit improvement from +1 ME / +2 TE (or +1 TE if small)
-    const current = await buildOpportunity_T1Manufacture({ bpo, bp, productTypeId, localCtx, jitaCtx, settings });
-    if (!current) return null;
+    const rmTimePerLevel = safeNum(rm?.time, 0);
+    const rtTimePerLevel = safeNum(rt?.time, 0);
 
-    const next = {
-      me: clamp(bpo.me + 1, 0, 10),
-      te: clamp(bpo.te + 2, 0, 20),
-    };
-    const improved = await buildOpportunity_T1Manufacture({ bpo: { ...bpo, ...next }, bp, productTypeId, localCtx, jitaCtx, settings });
-    if (!improved) return null;
+    const canImproveME = rmTimePerLevel > 0;
+    const canImproveTE = rtTimePerLevel > 0;
 
-    const deltaProfit = improved.metrics.profitRun - current.metrics.profitRun;
-    if (deltaProfit <= 0) return null;
+    if (!canImproveME && !canImproveTE) return null;
 
-    const horizonDays = safeNum(settings.horizonDays, 7);
+    // We use the current manufacturing opportunity as our price + fixed-cost baseline.
+    const currentMfg = await buildOpportunity_T1Manufacture({ bpo, bp, productTypeId, localCtx, jitaCtx, settings });
+    if (!currentMfg) return null;
+
+    const act = bp.activities.manufacturing;
+    if (!act?.materials?.length || !act?.time) return null;
+
     const util = clamp(safeNum(settings.utilPct, 70) / 100, 0.05, 1);
-    const mfgTimeHrs = (bp.activities.manufacturing?.time || 1) * teTimeMultiplier(bpo.te) / 3600;
-    const runsPerSlotPerDay = mfgTimeHrs > 0 ? (24 * util) / mfgTimeHrs : 0;
-    const expectedRuns = runsPerSlotPerDay * horizonDays;
+    const horizonDays = clamp(safeNum(settings.horizonDays, 7), 1, 365);
 
-    const roi = deltaProfit * expectedRuns;
+    const fmtDec = (n, digits = 1) => (Number.isFinite(n) ? n.toFixed(digits) : '0');
 
-    // Research time: use whichever exists; scale roughly by level.
-    const researchTime = (rm?.time || 0) + (rt?.time || 0);
-    const researchHours = researchTime / 3600;
+    // Build per-unit price map for manufacturing materials (so we can recompute ME scenarios without refetching prices).
+    const unitPriceByTypeId = new Map();
+    for (const row of currentMfg.breakdown.materials?.rows || []) {
+      if (!row || !row.typeId) continue;
+      unitPriceByTypeId.set(row.typeId, safeNum(row.price, 0));
+    }
 
-    // Research material cost
+    const baseMaterials = act.materials;
+    const baseTimeSec = safeNum(act.time, 0);
+
+    // These costs are independent of ME/TE (in our simplified model) so we can reuse them.
+    const fixedCosts =
+      safeNum(currentMfg.breakdown.hauling?.haulingCost, 0) +
+      safeNum(currentMfg.breakdown.hauling?.riskCost, 0) +
+      safeNum(currentMfg.breakdown.hauling?.lossExpected, 0) +
+      safeNum(currentMfg.breakdown.sellFees?.total, 0);
+
+    const revenueTotal = safeNum(currentMfg.breakdown.revenue?.total, 0);
+    const competition = safeNum(currentMfg.metrics?.competition, 50);
+
+    function estimateMfgAt(me, te) {
+      // IMPORTANT: Keep this consistent with buildOpportunity_T1Manufacture()
+      const mMult = 1 + meWasteMultiplier(me);
+      let matsTotal = 0;
+      for (const m of baseMaterials) {
+        const tid = m.typeId;
+        const baseQty = safeNum(m.quantity, 0);
+        const adjQty = Math.ceil(baseQty * mMult);
+        const unit = safeNum(unitPriceByTypeId.get(tid), 0);
+        matsTotal += adjQty * unit;
+      }
+
+      const jobFee = computeManufacturingJobFee(matsTotal, settings.systemIndexMultiplier);
+      const timeSec = baseTimeSec * teTimeMultiplier(te);
+      const timeHrs = timeSec / 3600;
+      const totalCost = matsTotal + jobFee + fixedCosts;
+
+      const profitRun = revenueTotal - totalCost;
+      const marginPct = revenueTotal > 0 ? (profitRun / revenueTotal) * 100 : -100;
+      const profitPerHour = timeHrs > 0 ? profitRun / timeHrs : profitRun;
+
+      // Profit/day per *one* manufacturing slot at your utilization setting.
+      const profitPerDayUtil = profitPerHour * 24 * util;
+
+      return { matsTotal, jobFee, timeSec, timeHrs, profitRun, marginPct, profitPerDayUtil };
+    }
+
+    // Baseline: do we manufacture at current ME/TE for the full horizon?
+    // If baseline is negative, assume you'd simply *not* run it (baseline = 0).
+    const baseEst = estimateMfgAt(bpo.me, bpo.te);
+    const baselineTotal = Math.max(0, baseEst.profitPerDayUtil) * horizonDays;
+
+    // Pre-price research materials ONCE (research cost scales linearly per level).
     const mineralNames = new Set(['tritanium', 'pyerite', 'mexallon', 'isogen', 'nocxium', 'zydrine', 'megacyte', 'morphite']);
-    const rmCost = rm?.materials?.length
+
+    const rmCost1 = rm?.materials?.length
       ? await computeMaterialCost(rm.materials, {
           localCtx,
           jitaCtx,
@@ -1713,44 +1761,164 @@
         })
       : { total: 0, rows: [], sources: [] };
 
-    const cost = rmCost.total;
-    const net = roi - cost;
+    const rtCost1 = rt?.materials?.length
+      ? await computeMaterialCost(rt.materials, {
+          localCtx,
+          jitaCtx,
+          costBasis: settings.costPriceBasis,
+          sourceFromReprocessing: settings.sourceFromReprocessing,
+          mineralOpportunityBasis: settings.mineralOpportunityBasis,
+          mineralNames,
+          reprocEff: settings.reprocEff,
+        })
+      : { total: 0, rows: [], sources: [] };
 
-    // Only recommend if within horizon and net positive.
-    const viable = net > 0 && researchHours / (24 * util) < horizonDays;
-    if (!viable) return null;
+    function scaleMatCost(costObj, mult) {
+      if (!mult || mult <= 0) return { total: 0, rows: [], sources: costObj?.sources || [] };
+      const rows = (costObj?.rows || []).map((r) => ({
+        ...r,
+        qty: safeNum(r.qty, 0) * mult,
+        line: safeNum(r.line, 0) * mult,
+      }));
+      return { total: safeNum(costObj?.total, 0) * mult, rows, sources: costObj?.sources || [] };
+    }
+
+    function mergeMatCosts(a, b) {
+      const map = new Map();
+      const sources = new Set([...(a?.sources || []), ...(b?.sources || [])]);
+
+      function addRow(r) {
+        if (!r || !r.typeId) return;
+        const tid = r.typeId;
+        const existing = map.get(tid);
+        if (!existing) {
+          map.set(tid, { ...r });
+        } else {
+          existing.qty = safeNum(existing.qty, 0) + safeNum(r.qty, 0);
+          existing.line = safeNum(existing.line, 0) + safeNum(r.line, 0);
+        }
+      }
+
+      (a?.rows || []).forEach(addRow);
+      (b?.rows || []).forEach(addRow);
+
+      return {
+        total: safeNum(a?.total, 0) + safeNum(b?.total, 0),
+        rows: Array.from(map.values()),
+        sources: Array.from(sources),
+      };
+    }
+
+    const maxMe = 10;
+    const maxTe = 20;
+
+    let best = null;
+
+    // Search candidate targets. This is cheap because prices are already known.
+    for (let targetMe = bpo.me; targetMe <= maxMe; targetMe++) {
+      for (let targetTe = bpo.te; targetTe <= maxTe; targetTe++) {
+        const dME = targetMe - bpo.me;
+        const dTE = targetTe - bpo.te;
+        if (dME === 0 && dTE === 0) continue;
+
+        if (dME > 0 && !canImproveME) continue;
+        if (dTE > 0 && !canImproveTE) continue;
+
+        const researchTimeSec = rmTimePerLevel * dME + rtTimePerLevel * dTE;
+        if (researchTimeSec <= 0) continue;
+
+        const researchHours = researchTimeSec / 3600;
+        const researchDays = researchHours / (24 * util);
+        const benefitDays = horizonDays - researchDays;
+        if (benefitDays <= 0) continue;
+
+        const targetEst = estimateMfgAt(targetMe, targetTe);
+        const afterTotal = Math.max(0, targetEst.profitPerDayUtil) * benefitDays;
+
+        const researchCost = safeNum(rmCost1.total, 0) * dME + safeNum(rtCost1.total, 0) * dTE;
+
+        // Net gain vs baseline strategy.
+        const netGain = afterTotal - baselineTotal - researchCost;
+        if (netGain <= 0) continue;
+
+        if (
+          !best ||
+          netGain > best.netGain + 1e-6 ||
+          (Math.abs(netGain - best.netGain) <= 1e-6 && researchTimeSec < best.researchTimeSec) ||
+          (Math.abs(netGain - best.netGain) <= 1e-6 && researchTimeSec === best.researchTimeSec && dME + dTE < best.deltaLevels)
+        ) {
+          best = {
+            targetMe,
+            targetTe,
+            dME,
+            dTE,
+            deltaLevels: dME + dTE,
+            researchTimeSec,
+            researchHours,
+            researchDays,
+            benefitDays,
+            targetEst,
+            netGain,
+            baselineTotal,
+            afterTotal,
+            researchCost,
+          };
+        }
+      }
+    }
+
+    if (!best) return null;
+
+    const scaledME = scaleMatCost(rmCost1, best.dME);
+    const scaledTE = scaleMatCost(rtCost1, best.dTE);
+    const researchMats = mergeMatCosts(scaledME, scaledTE);
+
+    const grossGain = best.afterTotal - best.baselineTotal; // before research material costs
+    const net = best.netGain;
+
+    const label = `Research ME/TE first (to ME${best.targetMe} TE${best.targetTe})`;
+
+    const steps = [];
+    if (best.dME > 0) steps.push(`Start ME research to reach ME${best.targetMe} (estimated).`);
+    if (best.dTE > 0) steps.push(`Start TE research to reach TE${best.targetTe} (estimated).`);
+    steps.push(
+      `Then manufacture for ~${fmtDec(best.benefitDays, 1)} days of your ${horizonDays}-day horizon (BPO is tied up during research).`
+    );
+
+    const noteBits = [];
+    noteBits.push(`Searches ME${bpo.me}→${maxMe} and TE${bpo.te}→${maxTe} and picks the best net gain over ${horizonDays}d.`);
+    noteBits.push(`Baseline: ${fmtIsk(baseEst.profitPerDayUtil)}/day/slot @ ME${bpo.me} TE${bpo.te}.`);
+    noteBits.push(`After: ${fmtIsk(best.targetEst.profitPerDayUtil)}/day/slot @ ME${best.targetMe} TE${best.targetTe}.`);
+    noteBits.push(`Research time: ${fmtDec(best.researchHours, 1)}h (~${fmtDec(best.researchDays, 2)}d @ ${Math.round(util * 100)}% util).`);
+    noteBits.push(`Gross gain: ${fmtIsk(grossGain)} • Research mats: ${fmtIsk(researchMats.total)} • Net: ${fmtIsk(net)}.`);
 
     return {
       id: 'research_first',
-      label: `Research ME/TE first (to ME${next.me} TE${next.te})`,
+      label,
       productTypeId,
-      productName: current.productName,
+      productName: currentMfg.productName,
       kind: 'research',
-      slotProfile: { mfgHrs: 0, copyHrs: researchHours, invHrs: 0 },
+      slotProfile: { mfgHrs: 0, copyHrs: best.researchHours, invHrs: 0 },
       metrics: {
         profitRun: net,
-        profitHour: researchHours > 0 ? net / researchHours : net,
-        profitDay: researchHours > 0 ? (net / researchHours) * 24 : net,
+        profitHour: best.researchHours > 0 ? net / best.researchHours : net,
+        profitDay: best.researchHours > 0 ? (net / best.researchHours) * 24 : net,
         profitM3: 0,
         marginPct: 0,
-        capital: cost,
-        timeSec: researchTime,
+        capital: researchMats.total,
+        timeSec: best.researchTimeSec,
         volumeM3: 0,
-        competition: current.metrics.competition,
+        competition,
       },
       breakdown: {
-        materials: rmCost,
+        materials: researchMats,
         jobFee: 0,
-        revenue: { unitPrice: 0, qty: 0, total: roi, source: 'computed' },
+        revenue: { unitPrice: 0, qty: 0, total: grossGain, source: 'computed' },
         hauling: { haulingCost: 0, riskCost: 0, lossExpected: 0, notes: '' },
         sellFees: { broker: 0, tax: 0, total: 0 },
       },
-      steps: [
-        `Start ME research to reach ME${next.me} (estimated).`,
-        `Start TE research to reach TE${next.te} (estimated).`,
-        `Then manufacture as normal for the next ~${horizonDays} days.`
-      ],
-      notes: `Heuristic ROI over ${horizonDays} days of 1-slot production: +${fmtIsk(deltaProfit)} per run → ${fmtIsk(roi)} gain.`,
+      steps,
+      notes: noteBits.join(' '),
     };
   }
 
