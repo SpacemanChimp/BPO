@@ -19,7 +19,7 @@
   // Constants
   // -----------------------------
 
-  const APP_VERSION = '1.0.4';
+  const APP_VERSION = '1.0.5';
 
   const ESI_BASE = 'https://esi.evetech.net/latest';
   const ESI_DATASOURCE = 'datasource=tranquility';
@@ -78,6 +78,10 @@
     maxCompetition: 70,
 
     enableOtherInvention: false,
+
+    // Copy & Sell BPC (contract) estimates are low-confidence; OFF by default
+    enableBpcSales: false,
+    bpcSellThroughPct: 20,
     invChanceAmmo: 40,
     invChanceDrone: 35,
     invChanceRig: 40,
@@ -1609,12 +1613,17 @@
     const productPrice = await getLivePrices({ ...outputCtx, typeId: productTypeId });
     const unitSell = chooseSellPrice(productPrice, settings.revenuePriceBasis);
 
-    // Heuristic: BPC value ~ X% of full-run output value.
+        // Heuristic: BPC value ~ X% of full-run output value.
     const bpcFactor = 0.07; // 7% by default (documented in README)
-    const estRevenue = unitSell * maxRuns * bpcFactor;
+    const baseRevenue = unitSell * maxRuns * bpcFactor;
 
-    // Copy job fee: we approximate as a small fraction of output value (or zero).
-    const jobFee = estRevenue * 0.01;
+    // Liquidity haircut: contracts are not a real-time market.
+    // We model this as an expected sell-through %, applied to revenue only.
+    const sellThroughPct = clamp(safeNum(settings.bpcSellThroughPct, 20), 0, 100);
+    const estRevenue = baseRevenue * (sellThroughPct / 100);
+
+    // Copy job fee: we approximate as a small fraction of *pre-haircut* value (fees don’t get cheaper just because it sells slowly).
+    const jobFee = baseRevenue * 0.01;
     const profit = estRevenue - jobFee;
 
     const time = copyAct.time;
@@ -1626,6 +1635,7 @@
     return {
       id: 'copy_sell',
       label: 'Copy & sell BPC (estimate)',
+      flags: ['low_confidence', 'estimate'],
       productTypeId,
       productName,
       kind: 'copying',
@@ -1644,7 +1654,7 @@
       breakdown: {
         materials: { total: 0, rows: [], sources: [] },
         jobFee,
-        revenue: { unitPrice: unitSell, qty: maxRuns, total: estRevenue, source: productPrice.source },
+        revenue: { unitPrice: unitSell, qty: maxRuns, baseTotal: baseRevenue, sellThroughPct, total: estRevenue, source: productPrice.source },
         hauling: { haulingCost: 0, riskCost: 0, lossExpected: 0, notes: 'BPC sale assumed via contracts; hauling ignored.' },
         sellFees: { broker: 0, tax: 0, total: 0 },
       },
@@ -1993,11 +2003,13 @@
       console.warn('Failed to compute manufacturing opp:', e);
     }
 
-    try {
-      const c = await buildOpportunity_CopySell({ bpo, bp, productTypeId, localCtx, jitaCtx, settings });
-      if (c) ops.push(c);
-    } catch (e) {
-      console.warn('Failed to compute copy opp:', e);
+    if (settings.enableBpcSales) {
+      try {
+        const c = await buildOpportunity_CopySell({ bpo, bp, productTypeId, localCtx, jitaCtx, settings });
+        if (c) ops.push(c);
+      } catch (e) {
+        console.warn('Failed to compute copy opp:', e);
+      }
     }
 
     try {
@@ -2311,7 +2323,15 @@
     if (op.metrics && Number.isFinite(op.metrics.haulScore)) {
       rows.push(['Haul efficiency score', `${Math.round(op.metrics.haulScore)}/100`]);
     }
-    rows.push(['Revenue', -safeNum(op.breakdown.revenue?.total, 0)]);
+    // Copy & Sell BPC transparency
+    if (op.id === 'copy_sell' && op.breakdown.revenue) {
+      const r = op.breakdown.revenue;
+      if (Number.isFinite(r.baseTotal)) rows.push(['Est. contract value (pre-haircut)', fmtIsk(r.baseTotal)]);
+      if (r.sellThroughPct !== undefined) rows.push(['Sell-through assumption', `${Math.round(r.sellThroughPct)}%`]);
+    }
+
+    const revenueLabel = op.id === 'copy_sell' ? 'Revenue (after haircut)' : 'Revenue';
+    rows.push([revenueLabel, -safeNum(op.breakdown.revenue?.total, 0)]);
 
     const wrap = document.createElement('div');
     for (const [label, val] of rows) {
@@ -2354,7 +2374,15 @@
       return { tr, detail: null };
     }
 
-    actionTd.innerHTML = `<b>${escapeHtml(best.label)}</b><div class="muted" style="margin-top:6px">${escapeHtml(best.productName)}</div>`;
+    const lowConf = best.flags && best.flags.includes('low_confidence');
+    const badge = lowConf ? `<span class="pill warn" title="Estimated / low confidence">Estimated</span>` : '';
+    actionTd.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <b>${escapeHtml(best.label)}</b>
+        ${badge}
+      </div>
+      <div class="muted" style="margin-top:6px">${escapeHtml(best.productName)}</div>
+    `;
 
     const profitRunTd = document.createElement('td');
     profitRunTd.className = 'num';
@@ -2436,7 +2464,10 @@
       inputs.appendChild(renderMaterialList(inv.inputs?.rows || []));
       inventionDiv.appendChild(inputs);
     } else {
-      inventionDiv.innerHTML = `<div class="muted">No invention step in this path.</div>`;
+      const invHint = state.settings.enableOtherInvention
+        ? 'No invention step in this path.'
+        : 'No invention step in this path. (Note: by default invention is only evaluated for rigs/ammo/drones; enable “Enable invention for other categories” to evaluate modules/ships.)';
+      inventionDiv.innerHTML = `<div class="muted">${escapeHtml(invHint)}</div>`;
     }
 
     // detail row buttons
@@ -2539,7 +2570,9 @@
       }
       for (const it of arr) {
         const li = document.createElement('li');
-        li.innerHTML = `<b>${escapeHtml(it.label)}</b> — ${fmtIsk(it.value)}/day/slot`;
+        const est = it.op && it.op.flags && it.op.flags.includes('low_confidence');
+        const b = est ? ` <span class="pill warn" title="Estimated / low confidence">EST</span>` : '';
+        li.innerHTML = `<b>${escapeHtml(it.label)}</b>${b} — ${fmtIsk(it.value)}/day/slot`;
         target.appendChild(li);
       }
     }
@@ -2771,8 +2804,12 @@
     s.minProfit = safeNum(state.ui.minProfit.value, 250000);
     s.capitalCeiling = state.ui.capitalCeiling.value.trim();
     s.maxCompetition = safeNum(state.ui.maxCompetition.value, 70);
-
     s.enableOtherInvention = state.ui.enableOtherInvention.checked;
+
+    // Copy & Sell BPC controls (may not exist in older HTML)
+    s.enableBpcSales = state.ui.enableBpcSales ? state.ui.enableBpcSales.checked : !!s.enableBpcSales;
+    const _bpcSt = state.ui.bpcSellThroughPctNum ? state.ui.bpcSellThroughPctNum.value : (state.ui.bpcSellThroughPct ? state.ui.bpcSellThroughPct.value : s.bpcSellThroughPct);
+    s.bpcSellThroughPct = clamp(safeNum(_bpcSt, 20), 0, 100);
     s.invChanceAmmo = safeNum(state.ui.invChanceAmmo.value, 40);
     s.invChanceDrone = safeNum(state.ui.invChanceDrone.value, 35);
     s.invChanceRig = safeNum(state.ui.invChanceRig.value, 40);
@@ -2824,6 +2861,16 @@
     state.ui.inventionFeeRate.value = String(s.inventionFeeRate);
 
     state.ui.componentAwareness.checked = !!s.componentAwareness;
+
+    // Copy & Sell BPC controls (may not exist in older HTML)
+    if (state.ui.enableBpcSales) state.ui.enableBpcSales.checked = !!s.enableBpcSales;
+    if (state.ui.bpcSellThroughPct) state.ui.bpcSellThroughPct.value = String(clamp(safeNum(s.bpcSellThroughPct, 20), 0, 100));
+    if (state.ui.bpcSellThroughPctNum) state.ui.bpcSellThroughPctNum.value = String(clamp(safeNum(s.bpcSellThroughPct, 20), 0, 100));
+
+    // Disable/enable the liquidity haircut inputs based on the toggle
+    const bpcEnabled = !!(state.ui.enableBpcSales && state.ui.enableBpcSales.checked);
+    if (state.ui.bpcSellThroughPct) state.ui.bpcSellThroughPct.disabled = !bpcEnabled;
+    if (state.ui.bpcSellThroughPctNum) state.ui.bpcSellThroughPctNum.disabled = !bpcEnabled;
   }
 
   function wireSecurityPresetAuto() {
@@ -2955,6 +3002,11 @@
       inventionFeeRate: el('inventionFeeRate'),
       componentAwareness: el('componentAwareness'),
 
+      // Copy & Sell BPC controls
+      enableBpcSales: el('enableBpcSales'),
+      bpcSellThroughPct: el('bpcSellThroughPct'),
+      bpcSellThroughPctNum: el('bpcSellThroughPctNum'),
+
       // actions
       btnAnalyze: el('btnAnalyze'),
       btnLoadExample: el('btnLoadExample'),
@@ -3057,6 +3109,9 @@
       'decryptorCost',
       'inventionFeeRate',
       'componentAwareness',
+      'enableBpcSales',
+      'bpcSellThroughPct',
+      'bpcSellThroughPctNum',
     ];
     for (const id of watchIds) {
       const node = el(id);
@@ -3069,6 +3124,31 @@
         }, 150);
       });
     }
+
+    // Copy & Sell BPC: keep slider + number in sync and disable inputs when feature is OFF
+    const syncBpcSellThrough = () => {
+      if (!state.ui.bpcSellThroughPct || !state.ui.bpcSellThroughPctNum) return;
+      state.ui.bpcSellThroughPctNum.value = String(state.ui.bpcSellThroughPct.value);
+    };
+    const syncBpcSellThroughNum = () => {
+      if (!state.ui.bpcSellThroughPct || !state.ui.bpcSellThroughPctNum) return;
+      const v = clamp(safeNum(state.ui.bpcSellThroughPctNum.value, 20), 0, 100);
+      state.ui.bpcSellThroughPct.value = String(v);
+      state.ui.bpcSellThroughPctNum.value = String(v);
+    };
+    const updateBpcControls = () => {
+      const enabled = !!(state.ui.enableBpcSales && state.ui.enableBpcSales.checked);
+      if (state.ui.bpcSellThroughPct) state.ui.bpcSellThroughPct.disabled = !enabled;
+      if (state.ui.bpcSellThroughPctNum) state.ui.bpcSellThroughPctNum.disabled = !enabled;
+    };
+    if (state.ui.bpcSellThroughPct) state.ui.bpcSellThroughPct.addEventListener('input', syncBpcSellThrough);
+    if (state.ui.bpcSellThroughPctNum) state.ui.bpcSellThroughPctNum.addEventListener('change', syncBpcSellThroughNum);
+    if (state.ui.enableBpcSales) state.ui.enableBpcSales.addEventListener('change', () => {
+      updateBpcControls();
+      syncBpcSellThroughNum();
+    });
+    // initial
+    updateBpcControls();
 
     wireSecurityPresetAuto();
   }

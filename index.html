@@ -172,6 +172,32 @@
           </div>
         </details>
 
+        <details class="accordion">
+          <summary>Settings → Copying (BPC contracts)</summary>
+          <div class="accordion-body">
+            <label class="field checkbox">
+              <input id="enableBpcSales" type="checkbox" />
+              <span>Enable BPC contract sale estimates (advanced) (default OFF)</span>
+            </label>
+
+            <div class="hint">
+              <b>Copy &amp; Sell BPC</b> is an <b>estimate</b> (contracts aren’t in ESI) and depends heavily on liquidity.
+              Most players copy BPCs mainly for <b>invention</b> — not for contract trading.
+            </div>
+
+            <label class="field">
+              <span>Expected sell-through % (liquidity haircut)</span>
+              <div style="display:flex;align-items:center;gap:12px">
+                <input id="bpcSellThroughPct" type="range" min="0" max="100" step="1" />
+                <input id="bpcSellThroughPctNum" inputmode="numeric" style="width:90px" placeholder="20" />
+              </div>
+              <div class="hint">
+                Applied only to <b>Copy &amp; Sell BPC</b>: estimated revenue is multiplied by this (e.g. 20% = assume only 1/5 contracts sell).
+              </div>
+            </label>
+          </div>
+        </details>
+
         <details class="accordion" open>
           <summary>Settings → Logistics & Risk</summary>
           <div class="accordion-body">
@@ -251,7 +277,8 @@
 
             <div class="hint">
               By default, invention opportunities are only considered for: <b>Rigs</b>, <b>Ammo</b>, and <b>Drones</b>.
-              You can tweak baseline invention parameters below (used when blueprint-specific invention data isn’t bundled).
+              <b>Modules</b> (and most other categories) are excluded unless you enable “Enable invention for other categories”.
+              Invention is usually the practical path for T2; selling BPCs is niche and contract/liquidity dependent.
             </div>
 
             <div class="grid3">
@@ -427,6 +454,6 @@
     </footer>
 
     <!-- Cache-bust on GitHub Pages/CDNs when you update app.js -->
-    <script src="app.js?v=1.0.4"></script>
+    <script src="app.js?v=1.0.5"></script>
   </body>
 </html>
