@@ -603,12 +603,12 @@
     // Load /data subsets (offline-friendly). Blueprint recipes are ALWAYS local.
     // Runtime HTTP is used ONLY for live market pricing.
     try {
-      const [typesSde, nameIndex, blueprintsSde, mocks] = await Promise.all([
-        loadJson('data/types.sde.min.json'),
-        loadJson('data/name_index.min.json'),
-        loadJson('data/blueprints.sde.min.json'),
-        loadJson('data/mock_prices.min.json'),
-      ]);
+const [types, blueprints, nameIndex, mockPrices] = await Promise.all([
+  loadJson('data/types.sde.min.json'),
+  loadJson('data/blueprints.sde.min.json'),
+  loadJson('data/name_index.min.json'),
+  loadJson('data/mock_prices.min.json'),
+]);
       hydrateData(typesSde, nameIndex, blueprintsSde, mocks);
     } catch (e) {
       console.warn('Data folder load failed; using offline fallback.', e);
