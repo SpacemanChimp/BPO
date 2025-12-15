@@ -19,8 +19,7 @@
       <div class="header-actions">
         <button id="btnRefreshPrices" class="btn">Refresh Prices</button>
         <button id="btnClearCache" class="btn btn-ghost" title="Clears local cache for prices and type lookups">Clear Cache</button>
-        <a class="btn btn-ghost" href="README.md" target="_blank" rel="noreferrer">README</a>
-      </div>
+</div>
     </header>
 
     <main class="layout">
@@ -355,16 +354,16 @@
           <table class="results">
             <thead>
               <tr>
-                <th>Blueprint</th>
-                <th>Best action</th>
-                <th class="num">Profit/run</th>
-                <th class="num">Profit/hr</th>
-                <th class="num">Profit/day</th>
-                <th class="num">Profit/m³</th>
-                <th class="num">Margin</th>
-                <th class="num">Capital</th>
-                <th class="num">Time</th>
-                <th class="num">Comp.</th>
+                <th data-sort-key="blueprint">Blueprint</th>
+                <th data-sort-key="action">Best action</th>
+                <th class="num" data-sort-key="profitRun">Profit/run</th>
+                <th class="num" data-sort-key="profitHour">Profit/hr</th>
+                <th class="num" data-sort-key="profitDay">Profit/day</th>
+                <th class="num" data-sort-key="profitM3">Profit/m³</th>
+                <th class="num" data-sort-key="margin">Margin</th>
+                <th class="num" data-sort-key="capital">Capital</th>
+                <th class="num" data-sort-key="time">Time</th>
+                <th class="num" data-sort-key="comp">Comp.</th>
                 <th></th>
               </tr>
             </thead>
@@ -427,7 +426,6 @@
       <span>Static GitHub Pages • Vanilla JS • Live prices (ESI w/ cache & fallback) • Not affiliated with CCP Games</span>
     </footer>
 
-    <!-- Cache-bust on GitHub Pages/CDNs when you update app.js -->
-    <script src="app.js?v=1.0.3"></script>
+    <script src="app.js"></script>
   </body>
 </html>

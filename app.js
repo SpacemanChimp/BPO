@@ -6,10 +6,8 @@
   - Graceful degradation: cached → mocked prices
 
   Notes:
-  - Blueprint recipes (materials / times / invention/copy/research) are resolved locally from
-    bundled SDE subsets in /data/. We deliberately do NOT fetch blueprint recipes at runtime
-    (ESI limitation + CORS/reliability on GitHub Pages).
-  - Runtime HTTP is used ONLY for live market pricing (ESI) with caching + offline fallback.
+  - This app bundles a tiny offline /data subset, but will dynamically enrich blueprint data
+    from EVE Ref reference JSON when available (no auth required).
 */
 
 (function () {
@@ -31,11 +29,19 @@
     label: 'The Forge / Jita 4-4',
   };
 
-  // Blueprint recipes are resolved locally from bundled SDE subsets in /data/.
-  // We deliberately do NOT fetch blueprint recipes at runtime (ESI limitation + CORS/reliability on GitHub Pages).
+  // Public, unauthenticated blueprint reference JSON (very handy for filling gaps).
+  // Example: https://ref-data.everef.net/blueprints/2457
+  const EVEREF_BLUEPRINT_BASE = 'https://ref-data.everef.net/blueprints';
+
+  // Fuzzwork blueprint API (public, no auth). Expects PRODUCT typeID (not blueprint typeID).
+  // Example: https://www.fuzzwork.co.uk/blueprint/api/blueprint.php?typeid=587
+  const FUZZWORK_BLUEPRINT_API = 'https://www.fuzzwork.co.uk/blueprint/api/blueprint.php';
+
+  // Simple public CORS proxy (used only as a last-resort fallback when a public API doesn't send CORS headers).
+  // NOTE: Avoid relying on this for normal operation.
+  const CORS_PROXY_ALLORIGINS = 'https://api.allorigins.win/raw?url=';
 
   const STORAGE_KEYS = {
-    appVersion: 'evirp.appVersion.v1',
     settings: 'evirp.settings.v1',
     priceCache: 'evirp.prices.v1',
     typeCache: 'evirp.types.v1',
@@ -307,15 +313,10 @@
   const state = {
     settings: { ...DEFAULTS },
     data: {
-      // Offline SDE subset (bundled in /data). Runtime HTTP is used ONLY for market pricing.
-      typesById: new Map(), // typeId -> { typeId, name, volume, groupId, categoryId }
-      typesByName: new Map(), // exact name -> same info (convenience)
-      nameIndex: {}, // normalized name -> [typeId...]
-
-      blueprintsByTypeId: new Map(), // blueprintTypeId -> normalized blueprint record (internal shape)
-      blueprintTypeIdByProductTypeId: new Map(), // productTypeId -> blueprintTypeId
-
-      mockPricesByTypeId: new Map(), // typeId -> { buy, sell }
+      typesByName: new Map(),
+      blueprintsByTypeId: new Map(),
+      mockPricesByTypeId: new Map(),
+      categoryTagByTypeId: new Map(),
     },
     caches: {
       prices: {},
@@ -323,6 +324,7 @@
       blueprints: {},
     },
     ui: {},
+    table: { sortKey: null, sortDir: null },
     lastPriceSource: '—',
     lastPriceUpdatedAt: null,
   };
@@ -383,89 +385,6 @@
       .replace(/\u2013|\u2014/g, '-')
       .toLowerCase();
   }
-
-  function isNumericTypeIdInput(s) {
-    return /^\d+$/.test(String(s || '').trim());
-  }
-
-  function isBlueprintCategoryId(categoryId) {
-    return Number(categoryId) === 9; // SDE "Blueprint" category
-  }
-
-  function getLocalTypeRow(typeId) {
-    return state.data.typesById.get(Number(typeId)) || null;
-  }
-
-  function isBlueprintType(typeId) {
-    const row = getLocalTypeRow(typeId);
-    return isBlueprintCategoryId(row?.categoryId);
-  }
-
-  function getNameIndex() {
-    return state.data.nameIndex || {};
-  }
-
-  // Best match by: exact > startsWith > contains
-  function findBestNameIndexKey(queryNorm) {
-    const idx = getNameIndex();
-    if (!queryNorm) return null;
-    if (idx[queryNorm]) return queryNorm;
-
-    const keys = Object.keys(idx);
-
-    // startsWith
-    let bestKey = null;
-    let bestScore = -Infinity;
-    for (const key of keys) {
-      if (!key.startsWith(queryNorm)) continue;
-      // prefer the shortest completion
-      const score = 1000 - (key.length - queryNorm.length);
-      if (score > bestScore) {
-        bestScore = score;
-        bestKey = key;
-      }
-    }
-    if (bestKey) return bestKey;
-
-    // contains
-    for (const key of keys) {
-      const pos = key.indexOf(queryNorm);
-      if (pos === -1) continue;
-      const score = 500 - pos - (key.length - queryNorm.length) * 0.01;
-      if (score > bestScore) {
-        bestScore = score;
-        bestKey = key;
-      }
-    }
-    return bestKey;
-  }
-
-  function pickBlueprintTypeId(typeIds) {
-    const ids = (Array.isArray(typeIds) ? typeIds : []).map(Number).filter((n) => Number.isFinite(n));
-    if (!ids.length) return null;
-
-    // Prefer a blueprint that we actually have recipe data for
-    const withRecipe = ids.find((id) => state.data.blueprintsByTypeId.has(id));
-    if (withRecipe) return withRecipe;
-
-    // Else any blueprint category type
-    const bpCat = ids.find((id) => isBlueprintType(id));
-    return bpCat || ids[0];
-  }
-
-  function pickProductTypeId(typeIds) {
-    const ids = (Array.isArray(typeIds) ? typeIds : []).map(Number).filter((n) => Number.isFinite(n));
-    if (!ids.length) return null;
-
-    // Prefer a product that maps to a blueprint we have
-    const withBlueprint = ids.find((id) => state.data.blueprintTypeIdByProductTypeId.has(id));
-    if (withBlueprint) return withBlueprint;
-
-    // Else prefer non-blueprint category
-    const nonBp = ids.find((id) => !isBlueprintType(id));
-    return nonBp || ids[0];
-  }
-
 
   function el(id) {
     return document.getElementById(id);
@@ -598,188 +517,50 @@
   }
 
   async function loadBundledData() {
-    // If the app version changed, cached type/blueprint lookups from older builds can
-    // cause false "missing data" results. Clear them automatically.
-    const prevVer = lsGet(STORAGE_KEYS.appVersion, null);
-    if (prevVer !== APP_VERSION) {
-      clearCaches();
-      lsSet(STORAGE_KEYS.appVersion, APP_VERSION);
-    }
-
     // Load from localStorage caches
     state.caches.prices = lsGet(STORAGE_KEYS.priceCache, {});
     state.caches.types = lsGet(STORAGE_KEYS.typeCache, {});
     state.caches.blueprints = lsGet(STORAGE_KEYS.blueprintCache, {});
 
-    // Load /data subsets (offline-friendly). Blueprint recipes are ALWAYS local.
-    // Runtime HTTP is used ONLY for live market pricing.
+    // Load /data subsets (offline-friendly). If unavailable, fall back to baked defaults.
     try {
-      const [typesSde, nameIndex, blueprintsSde, mocks] = await Promise.all([
-        loadJson('data/types.sde.min.json'),
-        loadJson('data/name_index.min.json'),
-        loadJson('data/blueprints.sde.min.json'),
+      const [types, mocks, cats, blueprints] = await Promise.all([
+        loadJson('data/types.min.json'),
         loadJson('data/mock_prices.min.json'),
+        loadJson('data/category_map.min.json'),
+        loadJson('data/blueprints.min.json'),
       ]);
-      hydrateData(typesSde, nameIndex, blueprintsSde, mocks);
+      hydrateData(types, mocks, cats, blueprints);
     } catch (e) {
       console.warn('Data folder load failed; using offline fallback.', e);
-      hydrateDataFromFallback();
+      hydrateData(
+        { typesByName: OFFLINE_FALLBACK.typesByName },
+        { mockPricesByTypeId: OFFLINE_FALLBACK.mockPricesByTypeId },
+        { categoryTagByTypeId: OFFLINE_FALLBACK.categoryTagByTypeId },
+        { blueprintsByTypeId: OFFLINE_FALLBACK.blueprintsByTypeId }
+      );
     }
   }
 
-  function hydrateDataFromFallback() {
-    // Back-compat with the baked-in tiny fallback used for dev/offline demos.
-    // This is only used if /data JSON files fail to load.
-    state.data.typesById.clear();
+  function hydrateData(types, mocks, cats, blueprints) {
     state.data.typesByName.clear();
-    for (const [name, info] of Object.entries(OFFLINE_FALLBACK.typesByName || {})) {
-      const row = {
-        typeId: Number(info.typeId),
-        name,
-        volume: info.packaged_volume ?? info.volume ?? null,
-        groupId: info.group_id ?? null,
-        categoryId: null,
-      };
-      state.data.typesById.set(row.typeId, row);
-      state.data.typesByName.set(name, row);
-    }
-
-    state.data.nameIndex = {};
-    for (const [name, info] of Object.entries(OFFLINE_FALLBACK.typesByName || {})) {
-      const key = normalizeName(name);
-      state.data.nameIndex[key] = state.data.nameIndex[key] || [];
-      state.data.nameIndex[key].push(Number(info.typeId));
+    for (const [name, info] of Object.entries(types?.typesByName || {})) {
+      state.data.typesByName.set(name, info);
     }
 
     state.data.mockPricesByTypeId.clear();
-    for (const [typeId, price] of Object.entries(OFFLINE_FALLBACK.mockPricesByTypeId || OFFLINE_FALLBACK.mockPrices || {})) {
+    for (const [typeId, price] of Object.entries(mocks?.mockPricesByTypeId || {})) {
       state.data.mockPricesByTypeId.set(Number(typeId), price);
     }
 
+    state.data.categoryTagByTypeId.clear();
+    for (const [typeId, tag] of Object.entries(cats?.categoryTagByTypeId || {})) {
+      state.data.categoryTagByTypeId.set(Number(typeId), tag);
+    }
+
     state.data.blueprintsByTypeId.clear();
-    state.data.blueprintTypeIdByProductTypeId.clear();
-    for (const [typeId, bp] of Object.entries(OFFLINE_FALLBACK.blueprintsByTypeId || {})) {
-      const bpid = Number(typeId);
-      const normalized = normalizeBlueprintRecord(bp);
-      state.data.blueprintsByTypeId.set(bpid, normalized);
-      const prodId = normalized?.activities?.manufacturing?.product?.typeId;
-      if (prodId) state.data.blueprintTypeIdByProductTypeId.set(Number(prodId), bpid);
-    }
-  }
-
-  function hydrateData(typesSde, nameIndex, blueprintsSde, mocks) {
-    // --- Types ---
-    state.data.typesById.clear();
-    state.data.typesByName.clear();
-
-    for (const [typeId, row] of Object.entries(typesSde?.types || {})) {
-      const id = Number(typeId);
-      const info = {
-        typeId: id,
-        name: row?.name || `Type ${id}`,
-        volume: row?.volume ?? null,
-        groupId: row?.groupId ?? null,
-        categoryId: row?.categoryId ?? null,
-      };
-      state.data.typesById.set(id, info);
-      // Keep exact-name map for convenience (UI + exact match)
-      if (info.name) state.data.typesByName.set(info.name, info);
-    }
-
-    // --- Name index (normalized name -> typeId(s)) ---
-    // Expected file shape: { generated, nameIndex: { "<normalized name>": [typeId, ...] } }
-    state.data.nameIndex = (nameIndex && typeof nameIndex === 'object' ? nameIndex.nameIndex : null) || {};
-    if (!state.data.nameIndex || typeof state.data.nameIndex !== 'object') state.data.nameIndex = {};
-
-    // --- Blueprints (local SDE recipes; manufacturing + optional copy/invention/research) ---
-    state.data.blueprintsByTypeId.clear();
-    state.data.blueprintTypeIdByProductTypeId.clear();
-
-    for (const [bpTypeId, bp] of Object.entries(blueprintsSde?.blueprints || {})) {
-      const blueprintTypeId = Number(bpTypeId);
-
-      const productTypeId = Number(bp?.productTypeId);
-      const productQty = Number(bp?.productQty ?? 1);
-
-      // Manufacturing
-      const mfgTime = Number(bp?.time ?? 0);
-      const mfgMats = Array.isArray(bp?.materials) ? bp.materials : [];
-
-      // Optional activities (present in the bundled data when available)
-      const copyTime = Number(bp?.copyTime ?? 0);
-      const invTime = Number(bp?.invTime ?? 0);
-      const invMats = Array.isArray(bp?.invMaterials) ? bp.invMaterials : [];
-      const invProds = Array.isArray(bp?.invProducts) ? bp.invProducts : [];
-      const rmTime = Number(bp?.rmTime ?? 0);
-      const rmMats = Array.isArray(bp?.rmMaterials) ? bp.rmMaterials : [];
-      const rtTime = Number(bp?.rtTime ?? 0);
-      const rtMats = Array.isArray(bp?.rtMaterials) ? bp.rtMaterials : [];
-      const maxRuns = Number(bp?.maxRuns ?? bp?.maxProductionLimit ?? 0);
-
-      const blueprintName = state.data.typesById.get(blueprintTypeId)?.name || `Blueprint ${blueprintTypeId}`;
-
-      const normalized = normalizeBlueprintRecord({
-        blueprintTypeId,
-        name: blueprintName,
-        maxRuns: Number.isFinite(maxRuns) ? maxRuns : 0,
-        activities: {
-          manufacturing: {
-            time: mfgTime,
-            product: { typeId: productTypeId, quantity: productQty },
-            materials: mfgMats
-              .map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) }))
-              .filter((m) => Number.isFinite(m.typeId) && Number.isFinite(m.quantity) && m.typeId > 0 && m.quantity > 0),
-          },
-          ...(copyTime ? { copying: { time: copyTime } } : {}),
-          ...(invTime && invProds.length
-            ? {
-                invention: {
-                  time: invTime,
-                  materials: invMats
-                    .map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) }))
-                    .filter((m) => Number.isFinite(m.typeId) && Number.isFinite(m.quantity) && m.typeId > 0 && m.quantity > 0),
-                  products: invProds
-                    .map((row) => ({
-                      typeId: Number(row?.[0]),
-                      quantity: Number(row?.[1] ?? 1),
-                      probability: row?.length >= 3 ? Number(row?.[2]) : null,
-                    }))
-                    .filter((p) => Number.isFinite(p.typeId) && p.typeId > 0),
-                },
-              }
-            : {}),
-          ...((rmTime || rmMats.length)
-            ? {
-                research_material: {
-                  time: rmTime,
-                  materials: rmMats
-                    .map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) }))
-                    .filter((m) => Number.isFinite(m.typeId) && Number.isFinite(m.quantity) && m.typeId > 0 && m.quantity > 0),
-                },
-              }
-            : {}),
-          ...((rtTime || rtMats.length)
-            ? {
-                research_time: {
-                  time: rtTime,
-                  materials: rtMats
-                    .map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) }))
-                    .filter((m) => Number.isFinite(m.typeId) && Number.isFinite(m.quantity) && m.typeId > 0 && m.quantity > 0),
-                },
-              }
-            : {}),
-        },
-      });
-
-      state.data.blueprintsByTypeId.set(blueprintTypeId, normalized);
-      if (productTypeId) state.data.blueprintTypeIdByProductTypeId.set(productTypeId, blueprintTypeId);
-    }
-
-    // --- Mock prices ---
-    state.data.mockPricesByTypeId.clear();
-    const mockMap = mocks?.mockPricesByTypeId || mocks?.jita || {};
-    for (const [typeId, price] of Object.entries(mockMap)) {
-      state.data.mockPricesByTypeId.set(Number(typeId), price);
+    for (const [typeId, bp] of Object.entries(blueprints?.blueprintsByTypeId || {})) {
+      state.data.blueprintsByTypeId.set(Number(typeId), bp);
     }
   }
 
@@ -827,113 +608,157 @@
   async function resolveTypeIdByName(name) {
     if (!name) return null;
 
-    // Exact match in bundled subset (original casing)
+    // Exact match in bundled subset
     const exact = state.data.typesByName.get(name);
     if (exact?.typeId) return exact.typeId;
 
-    const norm = normalizeName(name);
-    const cacheKey = `typeIdByName:${norm}`;
+    // Cached lookup
+    const cacheKey = `typeIdByName:${normalizeName(name)}`;
     const cached = getCachedEntry(state.caches.types, cacheKey);
     if (cached) return cached;
 
-    // Local name index match: exact > startsWith > contains
-    const bestKey = findBestNameIndexKey(norm);
-    if (bestKey) {
-      const ids = state.data.nameIndex?.[bestKey] || [];
-      const preferBlueprint = /\bblueprint\b/i.test(name) || /\sblueprint\s*$/i.test(name);
-      const typeId = preferBlueprint ? pickBlueprintTypeId(ids) : pickProductTypeId(ids);
-      if (typeId) {
-        setCachedEntry(state.caches.types, cacheKey, typeId, CACHE_TTL_MS.types);
-        return typeId;
-      }
-    }
+    const trySearch = async (strict) => {
+      const url = `${ESI_BASE}/search/?${ESI_DATASOURCE}&categories=inventory_type&strict=${strict ? 'true' : 'false'}&search=${encodeURIComponent(
+        name
+      )}`;
+      const res = await withTimeout(fetch(url, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI search');
+      if (!res.ok) throw new Error(`ESI search failed: ${res.status}`);
+      const data = await res.json();
+      return data?.inventory_type || [];
+    };
 
-    // As a small convenience: if the user didn't include "Blueprint", try appending it.
-    if (!/\bblueprint\b/i.test(name)) {
-      const withBp = `${norm} blueprint`;
-      const key2 = findBestNameIndexKey(withBp);
-      if (key2) {
-        const ids2 = state.data.nameIndex?.[key2] || [];
-        const typeId2 = pickBlueprintTypeId(ids2);
-        if (typeId2) {
-          setCachedEntry(state.caches.types, cacheKey, typeId2, CACHE_TTL_MS.types);
-          return typeId2;
-        }
-      }
-    }
+    try {
+      // Prefer exact match, then fall back to partial match.
+      let ids = await trySearch(true);
+      if (!ids.length) ids = await trySearch(false);
 
-    return null;
+      const typeId = ids.length ? ids[0] : null;
+      if (typeId) setCachedEntry(state.caches.types, cacheKey, typeId, CACHE_TTL_MS.types);
+      return typeId;
+    } catch (e) {
+      console.warn('Type search failed (ESI):', name, e);
+
+      // Last resort: normalized exact match in bundled subset
+      const want = normalizeName(name);
+      for (const [n, info] of state.data.typesByName.entries()) {
+        if (normalizeName(n) === want && info?.typeId) return info.typeId;
+      }
+      return null;
+    }
   }
 
   async function getTypeInfo(typeId) {
     if (!typeId) return null;
 
-    const id = Number(typeId);
-    const cacheKey = `typeInfo:${id}`;
+    const cacheKey = `typeInfo:${typeId}`;
     const cached = getCachedEntry(state.caches.types, cacheKey);
     if (cached) return cached;
 
-    const row = state.data.typesById.get(id);
-    if (row) {
-      const info = {
-        typeId: id,
-        name: row?.name || `Type ${id}`,
-        volume: row?.volume ?? null,
-        packaged_volume: row?.volume ?? null,
-        group_id: row?.groupId ?? null,
-        category_id: row?.categoryId ?? null,
+    // bundled subset fallback
+    for (const [name, info] of state.data.typesByName.entries()) {
+      if (info.typeId === typeId) {
+        const v = { name, ...info };
+        setCachedEntry(state.caches.types, cacheKey, v, CACHE_TTL_MS.types);
+        return v;
+      }
+    }
 
-        // Keep the SDE-style names too (handy for debugging)
-        groupId: row?.groupId ?? null,
-        categoryId: row?.categoryId ?? null,
+    try {
+      const url = `${ESI_BASE}/universe/types/${typeId}/?${ESI_DATASOURCE}`;
+      const res = await withTimeout(fetch(url, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI type');
+      if (!res.ok) throw new Error(`ESI type failed: ${res.status}`);
+      const d = await res.json();
+      const info = {
+        typeId,
+        name: d?.name || `Type ${typeId}`,
+        volume: d?.volume ?? null,
+        packaged_volume: d?.packaged_volume ?? d?.volume ?? null,
+        group_id: d?.group_id ?? null,
       };
       setCachedEntry(state.caches.types, cacheKey, info, CACHE_TTL_MS.types);
       return info;
+    } catch (e) {
+      console.warn('Type info fetch failed:', typeId, e);
+      // last resort: return something stable
+      const info = { typeId, name: `Type ${typeId}`, packaged_volume: null, group_id: null };
+      setCachedEntry(state.caches.types, cacheKey, info, 60 * 60 * 1000);
+      return info;
     }
-
-    // last resort: return something stable (no network calls)
-    const info = { typeId: id, name: `Type ${id}`, packaged_volume: null, group_id: null, category_id: null };
-    setCachedEntry(state.caches.types, cacheKey, info, 60 * 60 * 1000);
-    return info;
   }
 
   async function inferCategoryTagByTypeId(typeId) {
     if (!typeId) return 'other';
 
+    const local = state.data.categoryTagByTypeId.get(typeId);
+    if (local) return local;
+
     const cacheKey = `categoryTag:${typeId}`;
     const cached = getCachedEntry(state.caches.types, cacheKey);
     if (cached) return cached;
 
-    const info = await getTypeInfo(typeId);
-    const name = String(info?.name || '').toLowerCase();
-    const catId = Number(info?.category_id ?? info?.categoryId ?? NaN);
-    const groupId = Number(info?.group_id ?? info?.groupId ?? NaN);
+    try {
+      const info = await getTypeInfo(typeId);
+      if (!info?.group_id) return 'other';
 
-    let tag = 'other';
+      const groupUrl = `${ESI_BASE}/universe/groups/${info.group_id}/?${ESI_DATASOURCE}`;
+      const groupRes = await withTimeout(fetch(groupUrl, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI group');
+      if (!groupRes.ok) throw new Error(`ESI group failed: ${groupRes.status}`);
+      const group = await groupRes.json();
+      const gname = String(group?.name || '').toLowerCase();
+      const catId = group?.category_id;
 
-    // Prefer numeric IDs (stable), then fall back to name heuristics.
-    if (isBlueprintCategoryId(catId)) tag = 'blueprint';
-    else if (catId === 8) tag = 'ammo'; // "Charge" category
-    else if (catId === 18) tag = 'drone';
-    else if (catId === 7) {
-      // Category 7 covers modules & rigs. Rigs are groups ~773-782 in SDE.
-      if (Number.isFinite(groupId) && groupId >= 773 && groupId <= 782) tag = 'rig';
-      else tag = 'module';
-    } else {
-      // Heuristic fallback (only when categoryId isn't present in subset)
-      if (name.includes('rig')) tag = 'rig';
-      else if (name.includes('drone')) tag = 'drone';
-      else if (name.includes('charge') || name.includes('ammo') || name.includes('ammunition')) tag = 'ammo';
-      else if (name.includes('blueprint')) tag = 'blueprint';
+      let tag = 'other';
+      if (gname.includes('rig')) tag = 'rig';
+      else if (gname.includes('drone')) tag = 'drone';
+      else if (gname.includes('charge') || gname.includes('ammo') || gname.includes('ammunition')) tag = 'ammo';
+      else if (gname.includes('blueprint')) tag = 'blueprint';
+
+      // If ambiguous, look at category name too.
+      if (tag === 'other' && catId) {
+        const catUrl = `${ESI_BASE}/universe/categories/${catId}/?${ESI_DATASOURCE}`;
+        const catRes = await withTimeout(fetch(catUrl, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, 'ESI category');
+        if (catRes.ok) {
+          const cat = await catRes.json();
+          const cname = String(cat?.name || '').toLowerCase();
+          if (cname.includes('charge') || cname.includes('ammunition')) tag = 'ammo';
+          else if (cname.includes('drone')) tag = 'drone';
+        }
+      }
+
+      setCachedEntry(state.caches.types, cacheKey, tag, CACHE_TTL_MS.types);
+      return tag;
+    } catch (e) {
+      console.warn('Category infer failed:', typeId, e);
+      return 'other';
     }
-
-    setCachedEntry(state.caches.types, cacheKey, tag, CACHE_TTL_MS.types);
-    return tag;
   }
 
   // -----------------------------
-  // Blueprint recipe handling (local-only)
+  // Blueprint fetching (bundled subset + EVE Ref enrichment + Fuzzwork fallback)
   // -----------------------------
+
+  async function fetchJsonWithFallback(url, label) {
+    // Try direct fetch first.
+    try {
+      const res = await withTimeout(fetch(url, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, label);
+      if (!res.ok) throw new Error(`${label} failed: ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      // Most common here is CORS or transient network issues.
+      console.warn(`${label} direct fetch failed; trying CORS proxy...`, url, e);
+    }
+
+    // Last-resort: public CORS proxy
+    try {
+      const proxied = `${CORS_PROXY_ALLORIGINS}${encodeURIComponent(url)}`;
+      const res = await withTimeout(fetch(proxied, { cache: 'no-cache' }), REQUEST_TIMEOUT_MS, `${label} (proxy)`);
+      if (!res.ok) throw new Error(`${label} proxy failed: ${res.status}`);
+      return await res.json();
+    } catch (e2) {
+      console.warn(`${label} proxy fetch failed:`, url, e2);
+      return null;
+    }
+  }
 
   function normalizeBlueprintRecord(bp) {
     // Accept both local-bundled format and converted API formats.
@@ -942,192 +767,225 @@
     return bp;
   }
 
+  function convertEveRefBlueprintJson(json) {
+    if (!json?.blueprint_type_id || !json?.activities) return null;
+
+    const manufacturing = json.activities.manufacturing;
+    const copying = json.activities.copying;
+    const invention = json.activities.invention;
+    const researchMat = json.activities.research_material;
+    const researchTime = json.activities.research_time;
+
+    const productEntry = manufacturing?.products ? Object.values(manufacturing.products)[0] : null;
+    const product = productEntry ? { typeId: productEntry.type_id, quantity: productEntry.quantity } : null;
+
+    const materials = manufacturing?.materials
+      ? Object.values(manufacturing.materials).map((m) => ({ typeId: m.type_id, quantity: m.quantity }))
+      : [];
+
+    const invProducts = invention?.products ? Object.values(invention.products).map((p) => ({ typeId: p.type_id, quantity: p.quantity })) : [];
+    const invMaterials = invention?.materials
+      ? Object.values(invention.materials).map((m) => ({ typeId: m.type_id, quantity: m.quantity }))
+      : [];
+
+    const rmMaterials = researchMat?.materials
+      ? Object.values(researchMat.materials).map((m) => ({ typeId: m.type_id, quantity: m.quantity }))
+      : [];
+    const rtMaterials = researchTime?.materials
+      ? Object.values(researchTime.materials).map((m) => ({ typeId: m.type_id, quantity: m.quantity }))
+      : [];
+
+    return {
+      blueprintTypeId: json.blueprint_type_id,
+      name: `Blueprint ${json.blueprint_type_id}`,
+      maxRuns: json.max_production_limit ?? null,
+      activities: {
+        manufacturing: {
+          time: manufacturing?.time ?? null,
+          product,
+          materials,
+        },
+        copying: copying ? { time: copying.time ?? null } : null,
+        invention: invention ? { time: invention.time ?? null, products: invProducts, materials: invMaterials } : null,
+        research_material: researchMat ? { time: researchMat.time ?? null, materials: rmMaterials } : null,
+        research_time: researchTime ? { time: researchTime.time ?? null, materials: rtMaterials } : null,
+      },
+      _sources: { blueprint: 'everef' },
+    };
+  }
+
+  function convertFuzzworkBlueprintJson(json, blueprintTypeIdHint = null) {
+    // Fuzzwork API returns blueprint details keyed by PRODUCT typeID.
+    const details = json?.blueprintDetails;
+    if (!details?.productTypeID) return null;
+
+    const times = details.times || {};
+    const mats = json.activityMaterials || {};
+
+    const mapMats = (arr) => (Array.isArray(arr) ? arr.map((m) => ({ typeId: m.typeid, quantity: m.quantity })) : []);
+
+    const manufacturing = {
+      time: times['1'] ?? null,
+      product: { typeId: details.productTypeID, quantity: details.productQuantity ?? 1 },
+      materials: mapMats(mats['1']),
+    };
+
+    const copying = times['5'] != null ? { time: times['5'] } : null;
+    const invention = times['8'] != null || mats['8']
+      ? { time: times['8'] ?? null, products: [], materials: mapMats(mats['8']) }
+      : null;
+
+    const research_time = times['3'] != null ? { time: times['3'], materials: mapMats(mats['3']) } : null;
+    const research_material = times['4'] != null ? { time: times['4'], materials: mapMats(mats['4']) } : null;
+
+    // NOTE: Fuzzwork's endpoint does not include invention output blueprints/products, so
+    // the "Copy → Invention → Build" chain will only be enabled when we have EVE Ref data.
+    return {
+      blueprintTypeId: blueprintTypeIdHint,
+      name: blueprintTypeIdHint ? `Blueprint ${blueprintTypeIdHint}` : `${details.productTypeName} Blueprint`,
+      maxRuns: details.maxProductionLimit ?? null,
+      activities: { manufacturing, copying, invention, research_material, research_time },
+      _sources: { blueprint: 'fuzzwork', requestedId: json.requestedid, productTypeId: details.productTypeID },
+    };
+  }
 
   async function getBlueprintByProductTypeId(productTypeId, { blueprintTypeIdHint = null } = {}) {
-    // Local-only: resolve blueprint by productTypeId using bundled SDE subset.
     if (!productTypeId) return null;
 
-    const id = Number(productTypeId);
-    const cacheKey = `blueprintByProduct:${id}`;
+    const cacheKey = `blueprintByProduct:${productTypeId}`;
     const cached = getCachedEntry(state.caches.blueprints, cacheKey);
     if (cached) return cached;
 
-    const direct = state.data.blueprintTypeIdByProductTypeId.get(id);
-    const bpTypeId = Number(blueprintTypeIdHint) || direct;
-    if (bpTypeId) {
-      const bp = state.data.blueprintsByTypeId.get(bpTypeId) || null;
-      if (bp) {
-        setCachedEntry(state.caches.blueprints, cacheKey, bp, CACHE_TTL_MS.blueprints);
-        return bp;
+    const url = `${FUZZWORK_BLUEPRINT_API}?typeid=${productTypeId}`;
+    const j = await fetchJsonWithFallback(url, 'Fuzzwork blueprint');
+    const converted = j ? convertFuzzworkBlueprintJson(j, blueprintTypeIdHint) : null;
+    if (converted) {
+      setCachedEntry(state.caches.blueprints, cacheKey, converted, CACHE_TTL_MS.blueprints);
+      if (blueprintTypeIdHint) {
+        setCachedEntry(state.caches.blueprints, `blueprint:${blueprintTypeIdHint}`, converted, CACHE_TTL_MS.blueprints);
       }
+      return converted;
     }
-
     return null;
   }
 
   async function getBlueprintByTypeId(typeId) {
     if (!typeId) return null;
 
-    const id = Number(typeId);
-    const cacheKey = `blueprint:${id}`;
+    const cacheKey = `blueprint:${typeId}`;
     const cached = getCachedEntry(state.caches.blueprints, cacheKey);
     if (cached) return cached;
 
-    const bundled = state.data.blueprintsByTypeId.get(id) || null;
+    const bundled = state.data.blueprintsByTypeId.get(typeId);
     if (bundled) {
       setCachedEntry(state.caches.blueprints, cacheKey, bundled, CACHE_TTL_MS.blueprints);
       return bundled;
+    }
+
+    // Primary: EVE Ref blueprint JSON by blueprint typeID.
+    const url = `${EVEREF_BLUEPRINT_BASE}/${typeId}`;
+    const j = await fetchJsonWithFallback(url, 'EVE Ref blueprint');
+    const converted = j ? convertEveRefBlueprintJson(j) : null;
+    if (converted) {
+      setCachedEntry(state.caches.blueprints, cacheKey, converted, CACHE_TTL_MS.blueprints);
+      return converted;
+    }
+
+    // Fallback: derive product typeID from the blueprint's type name, then query Fuzzwork.
+    try {
+      const t = await getTypeInfo(typeId);
+      const bpName = String(t?.name || '');
+      const prodName = bpName.replace(/\s*Blueprint\s*$/i, '').trim();
+      if (prodName && prodName !== bpName) {
+        const prodTypeId = await resolveTypeIdByName(prodName);
+        if (prodTypeId) {
+          const fw = await getBlueprintByProductTypeId(prodTypeId, { blueprintTypeIdHint: typeId });
+          if (fw) return fw;
+        }
+      }
+    } catch (e) {
+      console.warn('Fuzzwork fallback by blueprint name failed:', typeId, e);
     }
 
     return null;
   }
 
   async function resolveBlueprintConsiderProductName(name) {
-    // Local-only resolution.
-    // Returns: { name, blueprintTypeId, productTypeId, blueprint, reason? }
+    // Returns { blueprintTypeId, productTypeId, blueprint } or null
     if (!name) return null;
+    const nm = normalizeName(name);
 
-    const raw = String(name).trim();
-    const nm = normalizeName(raw);
+    const candidates = /\bblueprint\b/i.test(name) ? [name] : [name, `${name} Blueprint`];
 
-    // --- TypeID input (optional) ---
-    if (isNumericTypeIdInput(raw)) {
-      const typeId = Number(raw);
+    for (const cand of candidates) {
+      const hasBlueprintWord = /\bblueprint\b/i.test(cand);
+      const typeId = await resolveTypeIdByName(cand);
+      if (!typeId) continue;
 
-      // If they pasted a blueprint typeId
-      const bp = await getBlueprintByTypeId(typeId);
-      if (bp?.activities?.manufacturing?.product?.typeId) {
-        return {
-          name: raw,
-          blueprintTypeId: typeId,
-          productTypeId: bp.activities.manufacturing.product.typeId,
-          blueprint: bp,
-        };
-      }
-
-      // If they pasted a product typeId
-      const bp2 = await getBlueprintByProductTypeId(typeId);
-      if (bp2?.activities?.manufacturing?.product?.typeId) {
-        const bpid = bp2.blueprintTypeId ?? state.data.blueprintTypeIdByProductTypeId.get(typeId) ?? null;
-        return {
-          name: raw,
-          blueprintTypeId: bpid,
-          productTypeId: bp2.activities.manufacturing.product.typeId,
-          blueprint: bp2,
-        };
-      }
-
-      // Known type but not in blueprint subset
-      if (state.data.typesById.has(typeId)) {
-        return {
-          name: raw,
-          blueprintTypeId: isBlueprintType(typeId) ? typeId : null,
-          productTypeId: isBlueprintType(typeId) ? null : typeId,
-          blueprint: null,
-          reason: 'Blueprint not included in offline SDE subset.',
-        };
-      }
-
-      return { name: raw, blueprint: null, reason: 'Blueprint not included in offline SDE subset.' };
-    }
-
-    const wantsBlueprint = /\bblueprint\b/i.test(raw) || /\sblueprint\s*$/i.test(raw);
-
-    // --- Blueprint name input ---
-    if (wantsBlueprint) {
-      const stripped = nm.replace(/\s*blueprint\s*$/i, '').trim();
-      const q1 = nm.endsWith(' blueprint') ? nm : `${nm} blueprint`;
-      const q2 = stripped ? `${stripped} blueprint` : null;
-
-      const queries = [q1, q2, nm, stripped].filter(Boolean);
-
-      for (const q of queries) {
-        const key = findBestNameIndexKey(q);
-        if (!key) continue;
-        const ids = state.data.nameIndex?.[key] || [];
-        const bpTypeId = pickBlueprintTypeId(ids);
-        if (!bpTypeId) continue;
-
-        const bp = await getBlueprintByTypeId(bpTypeId);
+      if (hasBlueprintWord) {
+        // Candidate is a blueprint type name → blueprint typeID.
+        const bp = await getBlueprintByTypeId(typeId);
         if (bp?.activities?.manufacturing?.product?.typeId) {
           return {
-            name: raw,
-            blueprintTypeId: bpTypeId,
+            name: cand,
+            blueprintTypeId: typeId,
             productTypeId: bp.activities.manufacturing.product.typeId,
             blueprint: bp,
           };
         }
 
-        // Type exists, but recipe isn't bundled
-        return {
-          name: raw,
-          blueprintTypeId: bpTypeId,
-          productTypeId: null,
-          blueprint: null,
-          reason: 'Blueprint not included in offline SDE subset.',
-        };
-      }
-
-      return { name: raw, blueprint: null, reason: 'Blueprint not included in offline SDE subset.' };
-    }
-
-    // --- Product name input ---
-    const key = findBestNameIndexKey(nm);
-    if (key) {
-      const ids = state.data.nameIndex?.[key] || [];
-      const prodTypeId = pickProductTypeId(ids);
-
-      if (prodTypeId) {
-        const bp = await getBlueprintByProductTypeId(prodTypeId);
+        // If EVE Ref failed (e.g. CORS), try: strip "Blueprint" → resolve product → fuzzwork.
+        const prodName = cand.replace(/\s*Blueprint\s*$/i, '').trim();
+        if (prodName) {
+          const prodTypeId = await resolveTypeIdByName(prodName);
+          if (prodTypeId) {
+            const bp2 = await getBlueprintByProductTypeId(prodTypeId, { blueprintTypeIdHint: typeId });
+            if (bp2?.activities?.manufacturing?.product?.typeId) {
+              return {
+                name: cand,
+                blueprintTypeId: typeId,
+                productTypeId: bp2.activities.manufacturing.product.typeId,
+                blueprint: bp2,
+              };
+            }
+          }
+        }
+      } else {
+        // Candidate is a PRODUCT type name → product typeID → fuzzwork can return the blueprint data.
+        const bp = await getBlueprintByProductTypeId(typeId);
         if (bp?.activities?.manufacturing?.product?.typeId) {
-          const bpid = bp.blueprintTypeId ?? state.data.blueprintTypeIdByProductTypeId.get(prodTypeId) ?? null;
           return {
-            name: raw,
-            blueprintTypeId: bpid,
+            name: cand,
+            blueprintTypeId: bp.blueprintTypeId ?? null,
             productTypeId: bp.activities.manufacturing.product.typeId,
             blueprint: bp,
           };
         }
 
-        // If they pasted a blueprint name without the suffix, try the blueprint candidate too.
-        const maybeBpTypeId = pickBlueprintTypeId(ids);
-        const bp2 = await getBlueprintByTypeId(maybeBpTypeId);
+        // As a last resort, try treating this as a blueprint typeID.
+        const bp2 = await getBlueprintByTypeId(typeId);
         if (bp2?.activities?.manufacturing?.product?.typeId) {
           return {
-            name: raw,
-            blueprintTypeId: maybeBpTypeId,
+            name: cand,
+            blueprintTypeId: typeId,
             productTypeId: bp2.activities.manufacturing.product.typeId,
             blueprint: bp2,
           };
         }
-
-        return {
-          name: raw,
-          blueprintTypeId: null,
-          productTypeId: prodTypeId,
-          blueprint: null,
-          reason: 'Blueprint not included in offline SDE subset.',
-        };
       }
     }
 
-    // As a last convenience: treat it like they forgot the suffix.
-    const key2 = findBestNameIndexKey(`${nm} blueprint`);
-    if (key2) {
-      const ids2 = state.data.nameIndex?.[key2] || [];
-      const bpTypeId2 = pickBlueprintTypeId(ids2);
-      const bp3 = await getBlueprintByTypeId(bpTypeId2);
-      if (bp3?.activities?.manufacturing?.product?.typeId) {
-        return {
-          name: raw,
-          blueprintTypeId: bpTypeId2,
-          productTypeId: bp3.activities.manufacturing.product.typeId,
-          blueprint: bp3,
-        };
+    // Offline subset fallback: find any bundled blueprint that produces this product name.
+    for (const [typeId, bp] of state.data.blueprintsByTypeId.entries()) {
+      const prodId = bp?.activities?.manufacturing?.product?.typeId;
+      if (!prodId) continue;
+      const prodInfo = await getTypeInfo(prodId);
+      if (normalizeName(prodInfo?.name) === nm) {
+        return { name, blueprintTypeId: typeId, productTypeId: prodId, blueprint: bp };
       }
     }
 
-    return { name: raw, blueprint: null, reason: 'Blueprint not included in offline SDE subset.' };
+    return null;
   }
 // -----------------------------
   // Live pricing (ESI orders) + caching + fallback
@@ -1755,158 +1613,137 @@
     return 0.3;
   }
 
-    async function buildOpportunity_InventionChain({ bpo, bp, productTypeId, localCtx, jitaCtx, settings }) {
-      const inv = bp.activities.invention;
-      const copyAct = bp.activities.copying;
-      if (!inv?.products?.length || !copyAct?.time) return null;
+  async function buildOpportunity_InventionChain({ bpo, bp, productTypeId, localCtx, jitaCtx, settings }) {
+    const inv = bp.activities.invention;
+    const copyAct = bp.activities.copying;
+    if (!inv?.materials?.length || !inv?.products?.length || !copyAct?.time) return null;
 
-      const productInfo = await getTypeInfo(productTypeId);
-      const productName = productInfo?.name || 'Unknown product';
-      const tag = await inferCategoryTagByTypeId(productTypeId);
-      if (!inventionAllowed(tag, settings)) return null;
+    const productInfo = await getTypeInfo(productTypeId);
+    const productName = productInfo?.name || 'Unknown product';
+    const tag = await inferCategoryTagByTypeId(productTypeId);
+    if (!inventionAllowed(tag, settings)) return null;
 
-      // Copy time (for the invented BPC seed) — we assume one copy job per invention attempt.
-      const copyTime = copyAct.time * teTimeMultiplier(bpo.te);
+    // Invention result is a T2 blueprint type
+    const t2BlueprintTypeId = inv.products[0].typeId;
+    const t2Blueprint = await getBlueprintByTypeId(t2BlueprintTypeId);
+    if (!t2Blueprint?.activities?.manufacturing?.product?.typeId) return null;
 
-      // Invention inputs cost (use Jita buy by default)
-      const mineralNames = new Set(['tritanium', 'pyerite', 'mexallon', 'isogen', 'nocxium', 'zydrine', 'megacyte', 'morphite']);
-      const invInputsCost = await computeMaterialCost(inv.materials || [], {
-        localCtx,
-        jitaCtx,
-        costBasis: 'buy',
-        sourceFromReprocessing: false,
-        mineralOpportunityBasis: 'jita_buy',
-        mineralNames,
-        reprocEff: settings.reprocEff,
-      });
+    const t2ProductTypeId = t2Blueprint.activities.manufacturing.product.typeId;
+    const t2ProductInfo = await getTypeInfo(t2ProductTypeId);
+    const t2Name = t2ProductInfo?.name || `T2 type ${t2ProductTypeId}`;
 
-      const decryptorCost = safeNum(settings.decryptorCost, 0);
-      const invFee = computeInventionJobFee(invInputsCost.total + decryptorCost, safeNum(settings.inventionFeeRate, 1.5), settings.systemIndexMultiplier);
+    // Copy time (for the invented BPC seed) — we assume one copy job per invention attempt.
+    const copyTime = copyAct.time * teTimeMultiplier(bpo.te);
 
-      const settingsBaseChance = defaultInventionChance(tag, settings);
-      const useSdeProb = tag !== 'ammo' && tag !== 'drone' && tag !== 'rig';
+    // Invention inputs cost (use Jita buy by default)
+    const mineralNames = new Set(['tritanium', 'pyerite', 'mexallon', 'isogen', 'nocxium', 'zydrine', 'megacyte', 'morphite']);
+    const invInputsCost = await computeMaterialCost(inv.materials, {
+      localCtx,
+      jitaCtx,
+      costBasis: 'buy',
+      sourceFromReprocessing: false,
+      mineralOpportunityBasis: 'jita_buy',
+      mineralNames,
+      reprocEff: settings.reprocEff,
+    });
 
-      const candidates = [];
+    const decryptorCost = safeNum(settings.decryptorCost, 0);
+    const invFee = computeInventionJobFee(invInputsCost.total + decryptorCost, safeNum(settings.inventionFeeRate, 1.5), settings.systemIndexMultiplier);
+    const invChance = defaultInventionChance(tag, settings);
+    const expectedInvCostPerSuccess = invChance > 0 ? (invInputsCost.total + decryptorCost + invFee) / invChance : Infinity;
 
-      for (const out of inv.products) {
-        const t2BlueprintTypeId = Number(out?.typeId);
-        if (!t2BlueprintTypeId) continue;
+    // Manufacture T2
+    const t2Act = t2Blueprint.activities.manufacturing;
+    const t2Materials = t2Act.materials.map((m) => ({ ...m }));
+    const componentBudget = settings.componentAwareness ? { remaining: 6 } : null;
+    const t2MaterialCost = await computeMaterialCost(t2Materials, {
+      localCtx,
+      jitaCtx,
+      costBasis: settings.costPriceBasis,
+      sourceFromReprocessing: settings.sourceFromReprocessing,
+      mineralOpportunityBasis: settings.mineralOpportunityBasis,
+      mineralNames,
+      reprocEff: settings.reprocEff,
+      componentAwareness: !!settings.componentAwareness,
+      componentStage: 't2',
+      componentCompareBudget: componentBudget,
+      settings,
+    });
 
-        const t2Blueprint = await getBlueprintByTypeId(t2BlueprintTypeId);
-        const t2Act = t2Blueprint?.activities?.manufacturing;
-        if (!t2Act?.product?.typeId) continue;
+    const t2Time = (t2Act.time || 0) * teTimeMultiplier(bpo.te);
+    const t2JobFee = computeManufacturingJobFee(t2MaterialCost.total, settings.systemIndexMultiplier);
 
-        const t2ProductTypeId = t2Act.product.typeId;
-        const t2ProductInfo = await getTypeInfo(t2ProductTypeId);
-        const t2Name = t2ProductInfo?.name || `T2 type ${t2ProductTypeId}`;
+    // Revenue in Jita or local
+    const outCtx = settings.sellLocalToggle ? localCtx : jitaCtx;
+    const outPrice = await getLivePrices({ ...outCtx, typeId: t2ProductTypeId });
+    const unitRev = chooseSellPrice(outPrice, settings.revenuePriceBasis);
+    const outQty = t2Act.product.quantity || 1;
+    const revenue = unitRev * outQty;
+    const sellFees = computeSellFees(revenue, FEE_DEFAULTS.brokerFeeRate, FEE_DEFAULTS.salesTaxRate);
 
-        // Prefer SDE-provided base chance (probability) for non-(ammo/drone/rig).
-        let invChance = settingsBaseChance;
-        const sdeProb = Number(out?.probability);
-        if (useSdeProb && Number.isFinite(sdeProb) && sdeProb > 0 && sdeProb <= 1) {
-          invChance = sdeProb;
-        }
+    const prodVol = safeNum(t2ProductInfo?.packaged_volume ?? t2ProductInfo?.volume, 0);
+    const totalVol = prodVol * outQty;
+    const haul = computeHauling({
+      volumeM3: totalVol,
+      iskPerM3: settings.iskPerM3,
+      riskPremiumPct: settings.riskPremium,
+      lossRatePct: settings.lossRate,
+      sellLocally: settings.sellLocalToggle,
+    });
 
-        const expectedInvCostPerSuccess = invChance > 0 ? (invInputsCost.total + decryptorCost + invFee) / invChance : Infinity;
+    const totalTime = copyTime + (inv.time || 0) + t2Time;
+    const totalCosts = expectedInvCostPerSuccess + t2MaterialCost.total + t2JobFee + haul.haulingCost + haul.riskCost + haul.lossExpected + sellFees.total;
+    const profit = revenue - totalCosts;
 
-        // Manufacture T2
-        const t2Materials = (t2Act.materials || []).map((m) => ({ ...m }));
-        const componentBudget = settings.componentAwareness ? { remaining: 6 } : null;
-        const t2MaterialCost = await computeMaterialCost(t2Materials, {
-          localCtx,
-          jitaCtx,
-          costBasis: settings.costPriceBasis,
-          sourceFromReprocessing: settings.sourceFromReprocessing,
-          mineralOpportunityBasis: settings.mineralOpportunityBasis,
-          mineralNames,
-          reprocEff: settings.reprocEff,
-          componentAwareness: !!settings.componentAwareness,
-          componentStage: 't2',
-          componentCompareBudget: componentBudget,
-          settings,
-        });
+    const timeHours = totalTime / 3600;
+    const profitPerHour = timeHours > 0 ? profit / timeHours : profit;
+    const profitPerDay = profitPerHour * 24;
+    const profitPerM3 = totalVol > 0 ? profit / totalVol : 0;
+    const margin = revenue > 0 ? (profit / revenue) * 100 : -100;
+    const capital = expectedInvCostPerSuccess + t2MaterialCost.total + t2JobFee + haul.haulingCost;
 
-        const t2Time = (t2Act.time || 0) * teTimeMultiplier(bpo.te);
-        const t2JobFee = computeManufacturingJobFee(t2MaterialCost.total, settings.systemIndexMultiplier);
-
-        // Revenue in Jita or local
-        const outCtx = settings.sellLocalToggle ? localCtx : jitaCtx;
-        const outPrice = await getLivePrices({ ...outCtx, typeId: t2ProductTypeId });
-        const unitRev = chooseSellPrice(outPrice, settings.revenuePriceBasis);
-        const outQty = t2Act.product.quantity || 1;
-        const revenue = unitRev * outQty;
-        const sellFees = computeSellFees(revenue, FEE_DEFAULTS.brokerFeeRate, FEE_DEFAULTS.salesTaxRate);
-
-        const prodVol = safeNum(t2ProductInfo?.packaged_volume ?? t2ProductInfo?.volume, 0);
-        const totalVol = prodVol * outQty;
-        const haul = computeHauling({
-          volumeM3: totalVol,
-          iskPerM3: settings.iskPerM3,
-          riskPremiumPct: settings.riskPremium,
-          lossRatePct: settings.lossRate,
-          sellLocally: settings.sellLocalToggle,
-        });
-
-        const totalTime = copyTime + (inv.time || 0) + t2Time;
-        const totalCosts = expectedInvCostPerSuccess + t2MaterialCost.total + t2JobFee + haul.haulingCost + haul.riskCost + haul.lossExpected + sellFees.total;
-        const profit = revenue - totalCosts;
-
-        const timeHours = totalTime / 3600;
-        const profitPerHour = timeHours > 0 ? profit / timeHours : profit;
-        const profitPerDay = profitPerHour * 24;
-        const profitPerM3 = totalVol > 0 ? profit / totalVol : 0;
-        const margin = revenue > 0 ? (profit / revenue) * 100 : -100;
-        const capital = expectedInvCostPerSuccess + t2MaterialCost.total + t2JobFee + haul.haulingCost;
-
-        candidates.push({
-          id: 'copy_invent_build_ship',
-          label: settings.sellLocalToggle ? 'Copy → Invention → Build (T2) → sell local' : 'Copy → Invention → Build (T2) → ship to Jita',
-          productTypeId: t2ProductTypeId,
-          productName: t2Name,
-          kind: 'invention',
-          slotProfile: { mfgHrs: t2Time / 3600, copyHrs: copyTime / 3600, invHrs: (inv.time || 0) / 3600 },
-          metrics: {
-            profitRun: profit,
-            profitHour: profitPerHour,
-            profitDay: profitPerDay,
-            profitM3: profitPerM3,
-            marginPct: margin,
-            capital,
-            timeSec: totalTime,
-            volumeM3: totalVol,
-            competition: outPrice?.meta?.competition ?? 50,
-          },
-          breakdown: {
-            materials: t2MaterialCost,
-            jobFee: t2JobFee,
-            revenue: { unitPrice: unitRev, qty: outQty, total: revenue, source: outPrice.source },
-            hauling: haul,
-            sellFees,
-            invention: {
-              chance: invChance,
-              timeSec: inv.time || 0,
-              decryptorCost,
-              inputs: invInputsCost,
-              fee: invFee,
-              expectedCostPerSuccess: expectedInvCostPerSuccess,
-              t2BlueprintTypeId,
-            },
-          },
-          steps: [
-            `Copy ${productName} BPC (for invention).`,
-            `Run invention job (expected success: ${fmtPct(invChance * 100, 0)}).`,
-            `Manufacture ${t2Name}.`,
-            settings.sellLocalToggle ? 'Sell locally.' : 'Haul to Jita 4-4 and sell.',
-          ],
-        });
-      }
-
-      if (!candidates.length) return null;
-
-      // Pick the best T2 outcome using the same ranking mode as the main table.
-      candidates.sort((a, b) => rankScore(b, settings) - rankScore(a, settings));
-      return candidates[0];
-    }
+    return {
+      id: 'copy_invent_build_ship',
+      label: settings.sellLocalToggle ? 'Copy → Invention → Build (T2) → sell local' : 'Copy → Invention → Build (T2) → ship to Jita',
+      productTypeId: t2ProductTypeId,
+      productName: t2Name,
+      kind: 'invention',
+      slotProfile: { mfgHrs: t2Time / 3600, copyHrs: copyTime / 3600, invHrs: (inv.time || 0) / 3600 },
+      metrics: {
+        profitRun: profit,
+        profitHour: profitPerHour,
+        profitDay: profitPerDay,
+        profitM3: profitPerM3,
+        marginPct: margin,
+        capital,
+        timeSec: totalTime,
+        volumeM3: totalVol,
+        competition: outPrice?.meta?.competition ?? 50,
+      },
+      breakdown: {
+        materials: t2MaterialCost,
+        jobFee: t2JobFee,
+        revenue: { unitPrice: unitRev, qty: outQty, total: revenue, source: outPrice.source },
+        hauling: haul,
+        sellFees,
+        invention: {
+          chance: invChance,
+          timeSec: inv.time || 0,
+          decryptorCost,
+          inputs: invInputsCost,
+          fee: invFee,
+          expectedCostPerSuccess: expectedInvCostPerSuccess,
+          t2BlueprintTypeId,
+        },
+      },
+      steps: [
+        `Copy ${productName} BPC (for invention).`,
+        `Run invention job (expected success: ${fmtPct(invChance * 100, 0)}).`,
+        `Manufacture ${t2Name}.`,
+        settings.sellLocalToggle ? 'Sell locally.' : 'Haul to Jita 4-4 and sell.',
+      ],
+    };
+  }
 
   function effectiveProfitPerDay(op, settings) {
     // Profit/day per bottleneck slot (mfg/copy/inv) with utilization.
@@ -1977,7 +1814,7 @@
       return {
         bpo,
         missing: true,
-        error: resolved?.reason || 'Blueprint not included in offline SDE subset.',
+        error: 'Blueprint data not found. Try pasting the exact blueprint name, or check connectivity.',
         opportunities: [],
       };
     }
@@ -2046,6 +1883,176 @@
     state.ui.bottleneck.textContent = '—';
     state.ui.tripsWeek.textContent = '—';
   }
+
+// -----------------------------
+// Results table sorting (client-side)
+// -----------------------------
+
+function injectResultsTableSortStyles() {
+  // Inject a tiny bit of CSS so sortable headers look/feel clickable without touching styles.css.
+  if (document.getElementById('evirp-sort-css')) return;
+  const style = document.createElement('style');
+  style.id = 'evirp-sort-css';
+  style.textContent = `
+    table.results thead th.sortable { cursor: pointer; user-select: none; }
+    table.results thead th.sortable:hover { text-decoration: underline; }
+    table.results thead th.sortable[data-sort-dir="asc"]::after { content: " ▲"; opacity: 0.75; font-size: 0.9em; }
+    table.results thead th.sortable[data-sort-dir="desc"]::after { content: " ▼"; opacity: 0.75; font-size: 0.9em; }
+  `;
+  document.head.appendChild(style);
+}
+
+function sortKeyIsString(key) {
+  return key === 'blueprint' || key === 'action';
+}
+
+function defaultSortDirForKey(key) {
+  // Profit-like metrics feel best descending; names ascending.
+  return sortKeyIsString(key) ? 'asc' : 'desc';
+}
+
+function getSortValueForResult(r, key) {
+  if (!r || r.missing || !r.best) return null;
+  const op = r.best;
+  switch (key) {
+    case 'blueprint':
+      return r.bpo?.name || '';
+    case 'action':
+      return op.label || '';
+    case 'profitRun':
+      return safeNum(op.metrics?.profitRun, NaN);
+    case 'profitHour':
+      return safeNum(op.metrics?.profitHour, NaN);
+    case 'profitDay':
+      return safeNum(effectiveProfitPerDay(op, state.settings).profitDayTotal, NaN);
+    case 'profitM3':
+      return safeNum(op.metrics?.profitM3, NaN);
+    case 'margin':
+      return safeNum(op.metrics?.marginPct, NaN);
+    case 'capital':
+      return safeNum(op.metrics?.capital, NaN);
+    case 'time':
+      return safeNum(op.metrics?.timeSec, NaN);
+    case 'comp':
+      return safeNum(op.metrics?.competition, NaN);
+    default:
+      return null;
+  }
+}
+
+function getSortedResults(results) {
+  const arr = (results || []).map((r, idx) => ({ r, idx }));
+  const key = state.table?.sortKey;
+  const dir = state.table?.sortDir;
+  if (!key || !dir) return arr.map((x) => x.r);
+
+  const isString = sortKeyIsString(key);
+
+  arr.sort((A, B) => {
+    const a = A.r;
+    const b = B.r;
+
+    const aMissing = !a || a.missing || !a.best;
+    const bMissing = !b || b.missing || !b.best;
+
+    // Keep missing rows at the bottom regardless of sort direction.
+    if (aMissing && bMissing) return A.idx - B.idx;
+    if (aMissing) return 1;
+    if (bMissing) return -1;
+
+    const va = getSortValueForResult(a, key);
+    const vb = getSortValueForResult(b, key);
+
+    if (isString) {
+      const sa = String(va ?? '');
+      const sb = String(vb ?? '');
+      const cmp = sa.localeCompare(sb, undefined, { sensitivity: 'base' });
+      if (cmp) return dir === 'asc' ? cmp : -cmp;
+      return A.idx - B.idx;
+    }
+
+    const na = Number(va);
+    const nb = Number(vb);
+    const aBad = !Number.isFinite(na);
+    const bBad = !Number.isFinite(nb);
+    if (aBad && bBad) return A.idx - B.idx;
+    if (aBad) return 1;
+    if (bBad) return -1;
+
+    const cmp = na - nb;
+    if (cmp) return dir === 'asc' ? cmp : -cmp;
+    return A.idx - B.idx;
+  });
+
+  return arr.map((x) => x.r);
+}
+
+function updateResultsTableHeaderSortUI() {
+  const ths = state.ui?.resultsSortHeaders || [];
+  for (const th of ths) {
+    const key = th.dataset.sortKey;
+    if (key && state.table?.sortKey === key) {
+      th.dataset.sortDir = state.table.sortDir;
+      th.setAttribute('aria-sort', state.table.sortDir === 'asc' ? 'ascending' : 'descending');
+    } else {
+      th.removeAttribute('data-sort-dir');
+      th.removeAttribute('aria-sort');
+    }
+  }
+}
+
+function setResultsTableSort(key) {
+  if (!key) return;
+  if (!state.table) state.table = { sortKey: null, sortDir: null };
+
+  if (state.table.sortKey === key) {
+    // toggle direction
+    state.table.sortDir = state.table.sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    state.table.sortKey = key;
+    state.table.sortDir = defaultSortDirForKey(key);
+  }
+
+  updateResultsTableHeaderSortUI();
+
+  // Re-render with the new sort order (if we have results).
+  if (Array.isArray(state._lastResults) && state._lastResults.length) {
+    renderResultsTable(state._lastResults);
+  }
+}
+
+function wireResultsTableSorting() {
+  injectResultsTableSortStyles();
+  const ths = Array.from(document.querySelectorAll('table.results thead th[data-sort-key]'));
+  state.ui.resultsSortHeaders = ths;
+  for (const th of ths) {
+    th.classList.add('sortable');
+    th.tabIndex = 0;
+    th.setAttribute('role', 'button');
+    th.title = 'Click to sort';
+
+    th.addEventListener('click', () => setResultsTableSort(th.dataset.sortKey));
+    th.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        setResultsTableSort(th.dataset.sortKey);
+      }
+    });
+  }
+
+  updateResultsTableHeaderSortUI();
+}
+
+function renderResultsTable(results) {
+  const sorted = getSortedResults(results);
+  state.ui.resultsBody.innerHTML = '';
+  for (const r of sorted) {
+    const { tr } = renderOpportunityRow(r);
+    state.ui.resultsBody.appendChild(tr);
+  }
+}
+
+
 
   function setSummaryCards({ bottleneck, tripsPerWeek }) {
     const src = state.lastPriceSource || '—';
@@ -2700,13 +2707,7 @@
     assignHaulEfficiencyScores(resolved, state.settings);
 
     // Render
-    state.ui.resultsBody.innerHTML = '';
-    const renderedRows = [];
-    for (const r of resolved) {
-      const { tr } = renderOpportunityRow(r);
-      state.ui.resultsBody.appendChild(tr);
-      renderedRows.push({ result: r, row: tr });
-    }
+    renderResultsTable(resolved);
 
     renderTopLists(resolved);
     const tripsWeek = computeTripsPerWeek(resolved);
@@ -2742,7 +2743,7 @@
       'Antimatter Charge S Blueprint ME10 TE20',
       'Hobgoblin I Blueprint ME8 TE14',
       'Small Core Defense Field Extender I, ME8, TE14',
-      'Multispectrum Energized Membrane I Blueprint ME10 TE20',
+      'Void S Blueprint ME2 TE10',
     ].join('\n');
   }
 
@@ -2818,6 +2819,9 @@
       rowDetailTemplate: el('rowDetailTemplate'),
       statusBar: el('statusBar'),
     };
+
+    // Make results table sortable by clicking column headers
+    wireResultsTableSorting();
 
     // Some fields that were added in JS must exist
     if (!state.ui.systemIndexMultiplier) {
