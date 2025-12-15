@@ -1,34 +1,47 @@
 # EVE Industry Route Planner (Static GitHub Pages)
 
-A static (HTML/CSS/Vanilla JS) industry planner for EVE Online that lets you paste a list of blueprints (BPO/BPC) and ranks build opportunities using **live Jita prices**.
+A static (HTML/CSS/Vanilla JS) industry planner for EVE Online that lets you paste a list of blueprints (BPO/BPC) and ranks build opportunities using **live market prices** (Jita by default).
 
-This version is designed to work reliably on **GitHub Pages** without special browser settings.
+This build is designed to work reliably on **GitHub Pages** without special browser settings.
 
 ---
 
 ## Why blueprint recipes are bundled (offline SDE subset)
 
-**ESI does not provide** blueprint manufacturing materials / times / invention chains.
+**ESI does not provide** blueprint manufacturing materials, job times, copy/research times, or invention chain data.
 
-Historically, many community apps fetch blueprint recipes from third‑party SDE APIs (EVE Ref / Fuzzwork) from the browser. That approach is **not reliable on GitHub Pages** because those endpoints may not send permissive **CORS** headers, and browser-side fetches will fail.
+Many community tools pull recipe data from third‑party SDE APIs (EVE Ref / Fuzzwork) directly from the browser. That approach is **not reliable on GitHub Pages** because those endpoints may not send permissive **CORS** headers, so browser-side fetches can fail.
 
-**Solution:** all blueprint manufacturing recipes used by the app are resolved **locally** from JSON subsets bundled in `/data/`.
+**Solution:** all blueprint/type resolution and recipe data is bundled locally in `/data/` as small JSON files derived from SDE.
 
-✅ Runtime HTTP calls are used **only** for live market pricing (Jita).  
+✅ Runtime HTTP is used **only** for live market pricing + caching.
+
 ❌ Blueprint recipe resolution never depends on runtime web calls.
 
 ---
 
-## Included offline data coverage
+## Included offline data coverage (this repo)
 
-The bundled subset is intentionally minimal, but broad enough for common **Tech I** analysis:
+This repo ships with **mode: full** offline data, which covers:
 
-- **Tech I modules** (category “Module”): armor/shield mods, weapons, propulsion, ewar, capacitor modules, etc.
-- **Tech I rigs**
-- **Tech I ammo/charges**
-- **Tech I drones**
+- **All manufacturing blueprints** present in the SDE-derived dataset (Tech I + Tech II), including:
+  - modules (and rigs)
+  - ammo/charges
+  - drones
+  - ships
+  - components
+  - structures (where represented as manufacturing blueprints)
+- For each included blueprint, when present in SDE:
+  - **manufacturing** (time + material list + output)
+  - **copying** time
+  - **invention** (time + datacore/material list + possible T2 blueprint outputs)
+  - **research_material** time/materials
+  - **research_time** time/materials
 
-If an input blueprint isn’t present in the subset, the UI will clearly report:
+Notes:
+
+- Blueprints that *do not* have a **manufacturing** activity (e.g., some non-manufacturing formulas) are intentionally not included because the app currently models manufacturing/copy/invention/research paths.
+- If an input blueprint isn’t present, the UI will clearly report:
 
 > **“Blueprint not included in offline SDE subset.”**
 
@@ -36,32 +49,30 @@ If an input blueprint isn’t present in the subset, the UI will clearly report:
 
 ## Bundled data files
 
-All required recipe/type resolution data lives in `/data/`:
+All recipe/type resolution data lives in `/data/`:
 
-- `data/blueprints.sde.min.json`  
-  Manufacturing recipe subset:
+- `data/blueprints.sde.min.json`
   - `blueprintTypeId`
   - `productTypeId` + `productQty`
   - manufacturing `time`
-  - `materials`: `[typeId, qty]` pairs
+  - manufacturing `materials`: `[typeId, qty]` pairs
+  - optional: `copyTime`, `invTime`, `invMaterials`, `invProducts`, `rmTime`, `rmMaterials`, `rtTime`, `rtMaterials`, `maxRuns`
 
-- `data/types.sde.min.json`  
-  Type mapping:
+- `data/types.sde.min.json`
   - `typeId` → `name`, packaged `volume`, `groupId`, `categoryId`
 
-- `data/name_index.min.json`  
-  Name resolution:
+- `data/name_index.min.json`
   - normalized name → typeId(s)
   - supports resolving both **blueprint names** and **product names**
 
-- `data/mock_prices.min.json`  
-  Offline fallback prices for development / no-internet mode.
+- `data/mock_prices.min.json`
+  - offline fallback prices for development / no-internet mode.
 
 ---
 
 ## Input resolution rules
 
-The parser accepts any of:
+The parser accepts:
 
 - `Multispectrum Energized Membrane I Blueprint ME10 TE20`
 - `Multispectrum Energized Membrane I` (product name)
@@ -71,44 +82,39 @@ Resolution logic:
 
 1. Normalize input: trim, lowercase, collapse whitespace.
 2. Accept both with a `Blueprint` suffix or without.
-3. If the user enters a **product name**, resolve product `typeId` → map to blueprint via the local blueprint dataset.
+3. If the user enters a **product name**, resolve product `typeId` → map to blueprint via the bundled blueprint dataset.
 4. If the user enters a **blueprint name**, resolve directly to the blueprint `typeId`.
 5. If multiple matches exist, prefer: **exact** → **startsWith** → **contains**.
 
 ---
 
-## Expanding the offline SDE subset
+## Expanding / regenerating the offline data
 
-If you want more coverage (more blueprints, more categories, Tech II, invention chains, etc.), regenerate the JSON subset and commit it to `/data/`.
-
-A small helper script is provided:
+A helper script is included:
 
 `tools/build_sde_subset.py`
 
-### 1) Obtain SDE-derived reference data
+It consumes EVE Ref “reference-data” (SDE-derived) and regenerates the three bundled JSON files.
 
-Download EVE Ref “reference-data” (or an equivalent SDE-derived dump) and either:
+### 1) Download reference data
 
-- extract it to a directory, or
-- keep it as a tarball (`reference-data-latest.tar.xz`)
+Download the EVE Ref reference-data tarball and keep it locally (no browser/CORS involvement):
+
+- `reference-data-latest.tar.xz`
 
 ### 2) Run the generator
 
 From the repo root:
 
 ```bash
-python3 tools/build_sde_subset.py --refdata /path/to/reference-data --outdir ./data
-# OR
-python3 tools/build_sde_subset.py --tar /path/to/reference-data-latest.tar.xz --outdir ./data
+# Full coverage (recommended)
+python3 tools/build_sde_subset.py --tar ./reference-data-latest.tar.xz --outdir ./data --mode full
+
+# Smaller Tech I-focused subset (faster load)
+python3 tools/build_sde_subset.py --tar ./reference-data-latest.tar.xz --outdir ./data --mode t1
 ```
 
-The script will rewrite:
-
-- `data/blueprints.sde.min.json`
-- `data/types.sde.min.json`
-- `data/name_index.min.json`
-
-Then commit and redeploy your static site.
+Then commit the regenerated `/data/*.json` files and redeploy GitHub Pages.
 
 ---
 
@@ -118,4 +124,4 @@ These must work on GitHub Pages in Chrome:
 
 - Paste: `Multispectrum Energized Membrane I Blueprint` → resolves (no missing row).
 - Paste: `Multispectrum Energized Membrane I` → resolves via product → blueprint mapping.
-- With internet: live Jita pricing works, caching works, **Refresh** forces refresh.
+- With internet: live Jita pricing works, caching works, and **Refresh** forces a refresh.

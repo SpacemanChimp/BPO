@@ -6,8 +6,10 @@
   - Graceful degradation: cached → mocked prices
 
   Notes:
-  - This app bundles a tiny offline /data subset, but will dynamically enrich blueprint data
-    from EVE Ref reference JSON when available (no auth required).
+  - Blueprint recipes (materials / times / invention/copy/research) are resolved locally from
+    bundled SDE subsets in /data/. We deliberately do NOT fetch blueprint recipes at runtime
+    (ESI limitation + CORS/reliability on GitHub Pages).
+  - Runtime HTTP is used ONLY for live market pricing (ESI) with caching + offline fallback.
 */
 
 (function () {
@@ -17,7 +19,7 @@
   // Constants
   // -----------------------------
 
-  const APP_VERSION = '1.0.2';
+  const APP_VERSION = '1.0.3';
 
   const ESI_BASE = 'https://esi.evetech.net/latest';
   const ESI_DATASOURCE = 'datasource=tranquility';
@@ -33,6 +35,7 @@
   // We deliberately do NOT fetch blueprint recipes at runtime (ESI limitation + CORS/reliability on GitHub Pages).
 
   const STORAGE_KEYS = {
+    appVersion: 'evirp.appVersion.v1',
     settings: 'evirp.settings.v1',
     priceCache: 'evirp.prices.v1',
     typeCache: 'evirp.types.v1',
@@ -595,6 +598,14 @@
   }
 
   async function loadBundledData() {
+    // If the app version changed, cached type/blueprint lookups from older builds can
+    // cause false "missing data" results. Clear them automatically.
+    const prevVer = lsGet(STORAGE_KEYS.appVersion, null);
+    if (prevVer !== APP_VERSION) {
+      clearCaches();
+      lsSet(STORAGE_KEYS.appVersion, APP_VERSION);
+    }
+
     // Load from localStorage caches
     state.caches.prices = lsGet(STORAGE_KEYS.priceCache, {});
     state.caches.types = lsGet(STORAGE_KEYS.typeCache, {});
@@ -603,12 +614,12 @@
     // Load /data subsets (offline-friendly). Blueprint recipes are ALWAYS local.
     // Runtime HTTP is used ONLY for live market pricing.
     try {
-const [types, blueprints, nameIndex, mockPrices] = await Promise.all([
-  loadJson('data/types.sde.min.json'),
-  loadJson('data/blueprints.sde.min.json'),
-  loadJson('data/name_index.min.json'),
-  loadJson('data/mock_prices.min.json'),
-]);
+      const [typesSde, nameIndex, blueprintsSde, mocks] = await Promise.all([
+        loadJson('data/types.sde.min.json'),
+        loadJson('data/name_index.min.json'),
+        loadJson('data/blueprints.sde.min.json'),
+        loadJson('data/mock_prices.min.json'),
+      ]);
       hydrateData(typesSde, nameIndex, blueprintsSde, mocks);
     } catch (e) {
       console.warn('Data folder load failed; using offline fallback.', e);
@@ -680,28 +691,83 @@ const [types, blueprints, nameIndex, mockPrices] = await Promise.all([
     state.data.nameIndex = (nameIndex && typeof nameIndex === 'object' ? nameIndex.nameIndex : null) || {};
     if (!state.data.nameIndex || typeof state.data.nameIndex !== 'object') state.data.nameIndex = {};
 
-    // --- Blueprints (manufacturing recipes) ---
+    // --- Blueprints (local SDE recipes; manufacturing + optional copy/invention/research) ---
     state.data.blueprintsByTypeId.clear();
     state.data.blueprintTypeIdByProductTypeId.clear();
 
     for (const [bpTypeId, bp] of Object.entries(blueprintsSde?.blueprints || {})) {
       const blueprintTypeId = Number(bpTypeId);
+
       const productTypeId = Number(bp?.productTypeId);
       const productQty = Number(bp?.productQty ?? 1);
-      const time = Number(bp?.time ?? 0);
-      const mats = Array.isArray(bp?.materials) ? bp.materials : [];
+
+      // Manufacturing
+      const mfgTime = Number(bp?.time ?? 0);
+      const mfgMats = Array.isArray(bp?.materials) ? bp.materials : [];
+
+      // Optional activities (present in the bundled data when available)
+      const copyTime = Number(bp?.copyTime ?? 0);
+      const invTime = Number(bp?.invTime ?? 0);
+      const invMats = Array.isArray(bp?.invMaterials) ? bp.invMaterials : [];
+      const invProds = Array.isArray(bp?.invProducts) ? bp.invProducts : [];
+      const rmTime = Number(bp?.rmTime ?? 0);
+      const rmMats = Array.isArray(bp?.rmMaterials) ? bp.rmMaterials : [];
+      const rtTime = Number(bp?.rtTime ?? 0);
+      const rtMats = Array.isArray(bp?.rtMaterials) ? bp.rtMaterials : [];
+      const maxRuns = Number(bp?.maxRuns ?? bp?.maxProductionLimit ?? 0);
 
       const blueprintName = state.data.typesById.get(blueprintTypeId)?.name || `Blueprint ${blueprintTypeId}`;
 
       const normalized = normalizeBlueprintRecord({
         blueprintTypeId,
         name: blueprintName,
+        maxRuns: Number.isFinite(maxRuns) ? maxRuns : 0,
         activities: {
           manufacturing: {
-            time,
+            time: mfgTime,
             product: { typeId: productTypeId, quantity: productQty },
-            materials: mats.map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) })),
+            materials: mfgMats
+              .map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) }))
+              .filter((m) => Number.isFinite(m.typeId) && Number.isFinite(m.quantity) && m.typeId > 0 && m.quantity > 0),
           },
+          ...(copyTime ? { copying: { time: copyTime } } : {}),
+          ...(invTime && invProds.length
+            ? {
+                invention: {
+                  time: invTime,
+                  materials: invMats
+                    .map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) }))
+                    .filter((m) => Number.isFinite(m.typeId) && Number.isFinite(m.quantity) && m.typeId > 0 && m.quantity > 0),
+                  products: invProds
+                    .map((row) => ({
+                      typeId: Number(row?.[0]),
+                      quantity: Number(row?.[1] ?? 1),
+                      probability: row?.length >= 3 ? Number(row?.[2]) : null,
+                    }))
+                    .filter((p) => Number.isFinite(p.typeId) && p.typeId > 0),
+                },
+              }
+            : {}),
+          ...((rmTime || rmMats.length)
+            ? {
+                research_material: {
+                  time: rmTime,
+                  materials: rmMats
+                    .map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) }))
+                    .filter((m) => Number.isFinite(m.typeId) && Number.isFinite(m.quantity) && m.typeId > 0 && m.quantity > 0),
+                },
+              }
+            : {}),
+          ...((rtTime || rtMats.length)
+            ? {
+                research_time: {
+                  time: rtTime,
+                  materials: rtMats
+                    .map(([t, q]) => ({ typeId: Number(t), quantity: Number(q) }))
+                    .filter((m) => Number.isFinite(m.typeId) && Number.isFinite(m.quantity) && m.typeId > 0 && m.quantity > 0),
+                },
+              }
+            : {}),
         },
       });
 
@@ -1689,137 +1755,158 @@ const [types, blueprints, nameIndex, mockPrices] = await Promise.all([
     return 0.3;
   }
 
-  async function buildOpportunity_InventionChain({ bpo, bp, productTypeId, localCtx, jitaCtx, settings }) {
-    const inv = bp.activities.invention;
-    const copyAct = bp.activities.copying;
-    if (!inv?.materials?.length || !inv?.products?.length || !copyAct?.time) return null;
+    async function buildOpportunity_InventionChain({ bpo, bp, productTypeId, localCtx, jitaCtx, settings }) {
+      const inv = bp.activities.invention;
+      const copyAct = bp.activities.copying;
+      if (!inv?.products?.length || !copyAct?.time) return null;
 
-    const productInfo = await getTypeInfo(productTypeId);
-    const productName = productInfo?.name || 'Unknown product';
-    const tag = await inferCategoryTagByTypeId(productTypeId);
-    if (!inventionAllowed(tag, settings)) return null;
+      const productInfo = await getTypeInfo(productTypeId);
+      const productName = productInfo?.name || 'Unknown product';
+      const tag = await inferCategoryTagByTypeId(productTypeId);
+      if (!inventionAllowed(tag, settings)) return null;
 
-    // Invention result is a T2 blueprint type
-    const t2BlueprintTypeId = inv.products[0].typeId;
-    const t2Blueprint = await getBlueprintByTypeId(t2BlueprintTypeId);
-    if (!t2Blueprint?.activities?.manufacturing?.product?.typeId) return null;
+      // Copy time (for the invented BPC seed) — we assume one copy job per invention attempt.
+      const copyTime = copyAct.time * teTimeMultiplier(bpo.te);
 
-    const t2ProductTypeId = t2Blueprint.activities.manufacturing.product.typeId;
-    const t2ProductInfo = await getTypeInfo(t2ProductTypeId);
-    const t2Name = t2ProductInfo?.name || `T2 type ${t2ProductTypeId}`;
+      // Invention inputs cost (use Jita buy by default)
+      const mineralNames = new Set(['tritanium', 'pyerite', 'mexallon', 'isogen', 'nocxium', 'zydrine', 'megacyte', 'morphite']);
+      const invInputsCost = await computeMaterialCost(inv.materials || [], {
+        localCtx,
+        jitaCtx,
+        costBasis: 'buy',
+        sourceFromReprocessing: false,
+        mineralOpportunityBasis: 'jita_buy',
+        mineralNames,
+        reprocEff: settings.reprocEff,
+      });
 
-    // Copy time (for the invented BPC seed) — we assume one copy job per invention attempt.
-    const copyTime = copyAct.time * teTimeMultiplier(bpo.te);
+      const decryptorCost = safeNum(settings.decryptorCost, 0);
+      const invFee = computeInventionJobFee(invInputsCost.total + decryptorCost, safeNum(settings.inventionFeeRate, 1.5), settings.systemIndexMultiplier);
 
-    // Invention inputs cost (use Jita buy by default)
-    const mineralNames = new Set(['tritanium', 'pyerite', 'mexallon', 'isogen', 'nocxium', 'zydrine', 'megacyte', 'morphite']);
-    const invInputsCost = await computeMaterialCost(inv.materials, {
-      localCtx,
-      jitaCtx,
-      costBasis: 'buy',
-      sourceFromReprocessing: false,
-      mineralOpportunityBasis: 'jita_buy',
-      mineralNames,
-      reprocEff: settings.reprocEff,
-    });
+      const settingsBaseChance = defaultInventionChance(tag, settings);
+      const useSdeProb = tag !== 'ammo' && tag !== 'drone' && tag !== 'rig';
 
-    const decryptorCost = safeNum(settings.decryptorCost, 0);
-    const invFee = computeInventionJobFee(invInputsCost.total + decryptorCost, safeNum(settings.inventionFeeRate, 1.5), settings.systemIndexMultiplier);
-    const invChance = defaultInventionChance(tag, settings);
-    const expectedInvCostPerSuccess = invChance > 0 ? (invInputsCost.total + decryptorCost + invFee) / invChance : Infinity;
+      const candidates = [];
 
-    // Manufacture T2
-    const t2Act = t2Blueprint.activities.manufacturing;
-    const t2Materials = t2Act.materials.map((m) => ({ ...m }));
-    const componentBudget = settings.componentAwareness ? { remaining: 6 } : null;
-    const t2MaterialCost = await computeMaterialCost(t2Materials, {
-      localCtx,
-      jitaCtx,
-      costBasis: settings.costPriceBasis,
-      sourceFromReprocessing: settings.sourceFromReprocessing,
-      mineralOpportunityBasis: settings.mineralOpportunityBasis,
-      mineralNames,
-      reprocEff: settings.reprocEff,
-      componentAwareness: !!settings.componentAwareness,
-      componentStage: 't2',
-      componentCompareBudget: componentBudget,
-      settings,
-    });
+      for (const out of inv.products) {
+        const t2BlueprintTypeId = Number(out?.typeId);
+        if (!t2BlueprintTypeId) continue;
 
-    const t2Time = (t2Act.time || 0) * teTimeMultiplier(bpo.te);
-    const t2JobFee = computeManufacturingJobFee(t2MaterialCost.total, settings.systemIndexMultiplier);
+        const t2Blueprint = await getBlueprintByTypeId(t2BlueprintTypeId);
+        const t2Act = t2Blueprint?.activities?.manufacturing;
+        if (!t2Act?.product?.typeId) continue;
 
-    // Revenue in Jita or local
-    const outCtx = settings.sellLocalToggle ? localCtx : jitaCtx;
-    const outPrice = await getLivePrices({ ...outCtx, typeId: t2ProductTypeId });
-    const unitRev = chooseSellPrice(outPrice, settings.revenuePriceBasis);
-    const outQty = t2Act.product.quantity || 1;
-    const revenue = unitRev * outQty;
-    const sellFees = computeSellFees(revenue, FEE_DEFAULTS.brokerFeeRate, FEE_DEFAULTS.salesTaxRate);
+        const t2ProductTypeId = t2Act.product.typeId;
+        const t2ProductInfo = await getTypeInfo(t2ProductTypeId);
+        const t2Name = t2ProductInfo?.name || `T2 type ${t2ProductTypeId}`;
 
-    const prodVol = safeNum(t2ProductInfo?.packaged_volume ?? t2ProductInfo?.volume, 0);
-    const totalVol = prodVol * outQty;
-    const haul = computeHauling({
-      volumeM3: totalVol,
-      iskPerM3: settings.iskPerM3,
-      riskPremiumPct: settings.riskPremium,
-      lossRatePct: settings.lossRate,
-      sellLocally: settings.sellLocalToggle,
-    });
+        // Prefer SDE-provided base chance (probability) for non-(ammo/drone/rig).
+        let invChance = settingsBaseChance;
+        const sdeProb = Number(out?.probability);
+        if (useSdeProb && Number.isFinite(sdeProb) && sdeProb > 0 && sdeProb <= 1) {
+          invChance = sdeProb;
+        }
 
-    const totalTime = copyTime + (inv.time || 0) + t2Time;
-    const totalCosts = expectedInvCostPerSuccess + t2MaterialCost.total + t2JobFee + haul.haulingCost + haul.riskCost + haul.lossExpected + sellFees.total;
-    const profit = revenue - totalCosts;
+        const expectedInvCostPerSuccess = invChance > 0 ? (invInputsCost.total + decryptorCost + invFee) / invChance : Infinity;
 
-    const timeHours = totalTime / 3600;
-    const profitPerHour = timeHours > 0 ? profit / timeHours : profit;
-    const profitPerDay = profitPerHour * 24;
-    const profitPerM3 = totalVol > 0 ? profit / totalVol : 0;
-    const margin = revenue > 0 ? (profit / revenue) * 100 : -100;
-    const capital = expectedInvCostPerSuccess + t2MaterialCost.total + t2JobFee + haul.haulingCost;
+        // Manufacture T2
+        const t2Materials = (t2Act.materials || []).map((m) => ({ ...m }));
+        const componentBudget = settings.componentAwareness ? { remaining: 6 } : null;
+        const t2MaterialCost = await computeMaterialCost(t2Materials, {
+          localCtx,
+          jitaCtx,
+          costBasis: settings.costPriceBasis,
+          sourceFromReprocessing: settings.sourceFromReprocessing,
+          mineralOpportunityBasis: settings.mineralOpportunityBasis,
+          mineralNames,
+          reprocEff: settings.reprocEff,
+          componentAwareness: !!settings.componentAwareness,
+          componentStage: 't2',
+          componentCompareBudget: componentBudget,
+          settings,
+        });
 
-    return {
-      id: 'copy_invent_build_ship',
-      label: settings.sellLocalToggle ? 'Copy → Invention → Build (T2) → sell local' : 'Copy → Invention → Build (T2) → ship to Jita',
-      productTypeId: t2ProductTypeId,
-      productName: t2Name,
-      kind: 'invention',
-      slotProfile: { mfgHrs: t2Time / 3600, copyHrs: copyTime / 3600, invHrs: (inv.time || 0) / 3600 },
-      metrics: {
-        profitRun: profit,
-        profitHour: profitPerHour,
-        profitDay: profitPerDay,
-        profitM3: profitPerM3,
-        marginPct: margin,
-        capital,
-        timeSec: totalTime,
-        volumeM3: totalVol,
-        competition: outPrice?.meta?.competition ?? 50,
-      },
-      breakdown: {
-        materials: t2MaterialCost,
-        jobFee: t2JobFee,
-        revenue: { unitPrice: unitRev, qty: outQty, total: revenue, source: outPrice.source },
-        hauling: haul,
-        sellFees,
-        invention: {
-          chance: invChance,
-          timeSec: inv.time || 0,
-          decryptorCost,
-          inputs: invInputsCost,
-          fee: invFee,
-          expectedCostPerSuccess: expectedInvCostPerSuccess,
-          t2BlueprintTypeId,
-        },
-      },
-      steps: [
-        `Copy ${productName} BPC (for invention).`,
-        `Run invention job (expected success: ${fmtPct(invChance * 100, 0)}).`,
-        `Manufacture ${t2Name}.`,
-        settings.sellLocalToggle ? 'Sell locally.' : 'Haul to Jita 4-4 and sell.',
-      ],
-    };
-  }
+        const t2Time = (t2Act.time || 0) * teTimeMultiplier(bpo.te);
+        const t2JobFee = computeManufacturingJobFee(t2MaterialCost.total, settings.systemIndexMultiplier);
+
+        // Revenue in Jita or local
+        const outCtx = settings.sellLocalToggle ? localCtx : jitaCtx;
+        const outPrice = await getLivePrices({ ...outCtx, typeId: t2ProductTypeId });
+        const unitRev = chooseSellPrice(outPrice, settings.revenuePriceBasis);
+        const outQty = t2Act.product.quantity || 1;
+        const revenue = unitRev * outQty;
+        const sellFees = computeSellFees(revenue, FEE_DEFAULTS.brokerFeeRate, FEE_DEFAULTS.salesTaxRate);
+
+        const prodVol = safeNum(t2ProductInfo?.packaged_volume ?? t2ProductInfo?.volume, 0);
+        const totalVol = prodVol * outQty;
+        const haul = computeHauling({
+          volumeM3: totalVol,
+          iskPerM3: settings.iskPerM3,
+          riskPremiumPct: settings.riskPremium,
+          lossRatePct: settings.lossRate,
+          sellLocally: settings.sellLocalToggle,
+        });
+
+        const totalTime = copyTime + (inv.time || 0) + t2Time;
+        const totalCosts = expectedInvCostPerSuccess + t2MaterialCost.total + t2JobFee + haul.haulingCost + haul.riskCost + haul.lossExpected + sellFees.total;
+        const profit = revenue - totalCosts;
+
+        const timeHours = totalTime / 3600;
+        const profitPerHour = timeHours > 0 ? profit / timeHours : profit;
+        const profitPerDay = profitPerHour * 24;
+        const profitPerM3 = totalVol > 0 ? profit / totalVol : 0;
+        const margin = revenue > 0 ? (profit / revenue) * 100 : -100;
+        const capital = expectedInvCostPerSuccess + t2MaterialCost.total + t2JobFee + haul.haulingCost;
+
+        candidates.push({
+          id: 'copy_invent_build_ship',
+          label: settings.sellLocalToggle ? 'Copy → Invention → Build (T2) → sell local' : 'Copy → Invention → Build (T2) → ship to Jita',
+          productTypeId: t2ProductTypeId,
+          productName: t2Name,
+          kind: 'invention',
+          slotProfile: { mfgHrs: t2Time / 3600, copyHrs: copyTime / 3600, invHrs: (inv.time || 0) / 3600 },
+          metrics: {
+            profitRun: profit,
+            profitHour: profitPerHour,
+            profitDay: profitPerDay,
+            profitM3: profitPerM3,
+            marginPct: margin,
+            capital,
+            timeSec: totalTime,
+            volumeM3: totalVol,
+            competition: outPrice?.meta?.competition ?? 50,
+          },
+          breakdown: {
+            materials: t2MaterialCost,
+            jobFee: t2JobFee,
+            revenue: { unitPrice: unitRev, qty: outQty, total: revenue, source: outPrice.source },
+            hauling: haul,
+            sellFees,
+            invention: {
+              chance: invChance,
+              timeSec: inv.time || 0,
+              decryptorCost,
+              inputs: invInputsCost,
+              fee: invFee,
+              expectedCostPerSuccess: expectedInvCostPerSuccess,
+              t2BlueprintTypeId,
+            },
+          },
+          steps: [
+            `Copy ${productName} BPC (for invention).`,
+            `Run invention job (expected success: ${fmtPct(invChance * 100, 0)}).`,
+            `Manufacture ${t2Name}.`,
+            settings.sellLocalToggle ? 'Sell locally.' : 'Haul to Jita 4-4 and sell.',
+          ],
+        });
+      }
+
+      if (!candidates.length) return null;
+
+      // Pick the best T2 outcome using the same ranking mode as the main table.
+      candidates.sort((a, b) => rankScore(b, settings) - rankScore(a, settings));
+      return candidates[0];
+    }
 
   function effectiveProfitPerDay(op, settings) {
     // Profit/day per bottleneck slot (mfg/copy/inv) with utilization.
